@@ -1,0 +1,99 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id          Int        @id @default(autoincrement())
+  googleSub   String?    @unique @map("google_sub")
+  email       String     @unique
+  name        String?
+  role        String     @default("reportante") // "reportante" | "administrador"
+  createdAt   DateTime   @default(now()) @map("created_at")
+  lastLoginAt DateTime?  @map("last_login_at")
+  incidents   Incident[]
+
+  @@map("users")
+}
+
+model School {
+  code      String     @id
+  name      String
+  sections  Section[]
+  incidents Incident[]
+
+  @@map("schools")
+}
+
+model Section {
+  id            Int        @id @default(autoincrement())
+  schoolCode    String     @map("school_code")
+  school        School     @relation(fields: [schoolCode], references: [code], onDelete: Cascade)
+  className     String     @map("class_name")
+  grade         String?
+  track         String?
+  subtrack      String?
+  sectionLetter String?    @map("section_letter")
+  tipoClase     String?    @map("tipo_clase") // "Clase" | "Refuerzo" | "Remediación" (extraido de class_name)
+  subject       String?
+  classPeriod   String?    @map("class_period")
+  active        Boolean    @default(true)
+  createdAt     DateTime   @default(now()) @map("created_at")
+  updatedAt     DateTime   @updatedAt @map("updated_at")
+  incidents     Incident[]
+
+  @@unique([schoolCode, className])
+  @@index([schoolCode])
+  @@index([active])
+  @@map("sections")
+}
+
+model IncidentType {
+  id              Int        @id @default(autoincrement())
+  nombre          String     @unique
+  categoria       String // "secciones" | "estudiantes" | "docentes" | "contenido" | "otro"
+  descripcion     String?
+  requiereSeccion Boolean    @default(true) @map("requiere_seccion")
+  activo          Boolean    @default(true)
+  orden           Int        @default(0)
+  createdAt       DateTime   @default(now()) @map("created_at")
+  incidents       Incident[]
+
+  @@map("incident_types")
+}
+
+model Incident {
+  id               Int          @id @default(autoincrement())
+  incidentTypeId   Int          @map("incident_type_id")
+  incidentType     IncidentType @relation(fields: [incidentTypeId], references: [id])
+  schoolCode       String       @map("school_code")
+  school           School       @relation(fields: [schoolCode], references: [code])
+  sectionId        Int?         @map("section_id")
+  section          Section?     @relation(fields: [sectionId], references: [id])
+  descripcion      String
+  docenteNombre    String?      @map("docente_nombre")
+  docenteEmail     String?      @map("docente_email")
+  docenteTelefono  String?      @map("docente_telefono")
+  docenteDui       String?      @map("docente_dui")
+  estudiantes      String?
+  contenidoDetalle String?      @map("contenido_detalle")
+  prioridad        String       @default("media") // "baja" | "media" | "alta"
+  estado           String       @default("nueva") // "nueva" | "en_proceso" | "resuelta"
+  reportanteUserId Int?         @map("reportante_user_id")
+  reportanteUser   User?        @relation(fields: [reportanteUserId], references: [id])
+  reportanteNombre String?      @map("reportante_nombre")
+  reportanteEmail  String?      @map("reportante_email")
+  createdAt        DateTime     @default(now()) @map("created_at")
+  updatedAt        DateTime     @updatedAt @map("updated_at")
+  resolvedAt       DateTime?    @map("resolved_at")
+
+  @@index([schoolCode])
+  @@index([estado])
+  @@index([incidentTypeId])
+  @@index([createdAt])
+  @@map("incidents")
+}
