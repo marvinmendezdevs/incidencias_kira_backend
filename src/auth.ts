@@ -69,17 +69,36 @@ export function issueToken(user: AuthUser): string {
   );
 }
 
+// Frontend (Netlify) y backend (Render) viven en dominios distintos, asi que
+// la cookie de sesion tiene que ser cross-site: SameSite=None + Secure. Antes
+// esto dependia de poner NODE_ENV=production como variable de entorno en
+// Render; si se olvidaba (facil de olvidar), la cookie quedaba SameSite=Lax
+// y el navegador simplemente nunca la mandaba de vuelta en las peticiones a
+// la API, dando "No autenticado" en todo despues del login. Para que esto no
+// dependa de acordarse de una env var, ahora el default seguro (cross-site)
+// se usa siempre EXCEPTO cuando estamos explicitamente en desarrollo local
+// (NODE_ENV=development, que es lo que trae el .env de este proyecto).
+const IS_LOCAL_DEV = process.env.NODE_ENV === 'development';
+
+function cookieOptions() {
+  return {
+    httpOnly: true,
+    secure: !IS_LOCAL_DEV,
+    sameSite: (IS_LOCAL_DEV ? 'lax' : 'none') as 'lax' | 'none',
+  };
+}
+
 export function setAuthCookie(res: Response, token: string): void {
   res.cookie(COOKIE_NAME, token, {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+    ...cookieOptions(),
     maxAge: 7 * 24 * 60 * 60 * 1000,
   });
 }
 
 export function clearAuthCookie(res: Response): void {
-  res.clearCookie(COOKIE_NAME);
+  // clearCookie debe usar las mismas opciones (sameSite/secure/path) con las
+  // que se creo la cookie; si no coinciden, algunos navegadores no la borran.
+  res.clearCookie(COOKIE_NAME, cookieOptions());
 }
 
 declare global {
