@@ -50,6 +50,15 @@ function adminCookie() {
   return `incidencias_token=${token}`;
 }
 
+function reportanteCookie(id: number, email: string) {
+  const token = jwt.sign(
+    { id, email, name: email, role: 'reportante' },
+    process.env.JWT_SECRET as string,
+    { expiresIn: '1h' }
+  );
+  return `incidencias_token=${token}`;
+}
+
 test('API Incidencias KIRA (con Postgres real efimero)', async (t) => {
   await pg.initialise();
   await pg.start();
@@ -273,6 +282,71 @@ test('API Incidencias KIRA (con Postgres real efimero)', async (t) => {
       assert.equal(res.body.incident.estado, 'resuelta');
     });
 
+    await t.test("PATCH /api/incidents/:id acepta el estado 'no_aplica' y NO marca resolved_at", async () => {
+      const res = await request(app)
+        .patch(`/api/incidents/${docenteIncidentId}`)
+        .set('Cookie', adminCookie())
+        .send({ estado: 'no_aplica' });
+      assert.equal(res.status, 200);
+      assert.equal(res.body.incident.estado, 'no_aplica');
+
+      const full = await prisma.incident.findUnique({ where: { id: docenteIncidentId } });
+      assert.equal(full.resolvedAt, null);
+    });
+
+    await t.test('GET /api/incidents: quien no es administrador solo ve lo que el mismo reporto', async () => {
+      // reportanteUserId tiene una foreign key real hacia users.id, asi que
+      // el usuario tiene que existir de verdad (a diferencia del JWT, que se
+      // puede fabricar con cualquier id para las pruebas de auth/rol).
+      const reportante1 = await prisma.user.create({
+        data: { email: 'reportante1@edu.gob.sv', name: 'Reportante Uno', role: 'reportante' },
+      });
+      const reportante2 = await prisma.user.create({
+        data: { email: 'reportante2@edu.gob.sv', name: 'Reportante Dos', role: 'reportante' },
+      });
+      const cookie1 = reportanteCookie(reportante1.id, reportante1.email);
+      const cookie2 = reportanteCookie(reportante2.id, reportante2.email);
+
+      const create1 = await request(app)
+        .post('/api/incidents')
+        .set('Cookie', cookie1)
+        .send({
+          incident_type_id: incidentTypeId,
+          school_code: '10001',
+          section_id: seedSection.id,
+          descripcion: 'Incidencia reportada por reportante1.',
+        });
+      assert.equal(create1.status, 201);
+      const incident1Id = create1.body.id;
+
+      const create2 = await request(app)
+        .post('/api/incidents')
+        .set('Cookie', cookie2)
+        .send({
+          incident_type_id: incidentTypeId,
+          school_code: '10001',
+          section_id: seedSection.id,
+          descripcion: 'Incidencia reportada por reportante2.',
+        });
+      assert.equal(create2.status, 201);
+      const incident2Id = create2.body.id;
+
+      const listAsReportante1 = await request(app).get('/api/incidents').set('Cookie', cookie1);
+      assert.equal(listAsReportante1.status, 200);
+      assert.ok(listAsReportante1.body.incidents.length > 0);
+      assert.ok(listAsReportante1.body.incidents.every((i: any) => i.id === incident1Id));
+
+      const listAsAdmin = await request(app).get('/api/incidents').set('Cookie', adminCookie());
+      assert.ok(listAsAdmin.body.incidents.some((i: any) => i.id === incident1Id));
+      assert.ok(listAsAdmin.body.incidents.some((i: any) => i.id === incident2Id));
+
+      const getOwn = await request(app).get(`/api/incidents/${incident1Id}`).set('Cookie', cookie1);
+      assert.equal(getOwn.status, 200);
+
+      const getOther = await request(app).get(`/api/incidents/${incident2Id}`).set('Cookie', cookie1);
+      assert.equal(getOther.status, 404);
+    });
+
     await t.test('POST /api/admin/sections/import agrega una escuela y seccion nuevas por CSV', async () => {
       const csv =
         'code,school_name,class_name,grade,track,subtrack,section,subject,type,class_period,access_teacher,student_access_percentage,percentage_tasks_completed,percentage_correct_answers,recent_date_access,start_class,end_class,date\n' +
@@ -386,12 +460,12 @@ test('API Incidencias KIRA (con Postgres real efimero)', async (t) => {
     });
 
     await t.test('GET /api/admin/users pagina, busca y filtra', async () => {
-      // En este punto existen 5 usuarios: admin, desactivado, nueva.reportante,
-      // otro.reportante y duplicado (reactivado en la prueba anterior).
+      // En este punto existen 7 usuarios: admin, desactivado, nueva.reportante,
+      // otro.reportante, duplicado (reactivado), reportante1 y reportante2.
       const page1 = await request(app).get('/api/admin/users?page=1&pageSize=2').set('Cookie', adminCookie());
       assert.equal(page1.status, 200);
       assert.equal(page1.body.users.length, 2);
-      assert.equal(page1.body.total, 5);
+      assert.equal(page1.body.total, 7);
       assert.equal(page1.body.page, 1);
       assert.equal(page1.body.pageSize, 2);
 
@@ -419,12 +493,7 @@ test('API Incidencias KIRA (con Postgres real efimero)', async (t) => {
     });
 
     await t.test('GET/POST/PATCH /api/admin/users requieren rol administrador', async () => {
-      const reportanteToken = jwt.sign(
-        { id: 999, email: 'nueva.reportante@edu.gob.sv', name: 'Nueva Reportante', role: 'reportante' },
-        process.env.JWT_SECRET as string,
-        { expiresIn: '1h' }
-      );
-      const cookie = `incidencias_token=${reportanteToken}`;
+      const cookie = reportanteCookie(999, 'nueva.reportante@edu.gob.sv');
 
       const get = await request(app).get('/api/admin/users').set('Cookie', cookie);
       assert.equal(get.status, 403);

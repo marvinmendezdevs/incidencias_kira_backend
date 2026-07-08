@@ -7,9 +7,12 @@ import { asyncHandler } from '../lib/asyncHandler';
 const router = Router();
 
 const PRIORIDADES = new Set(['baja', 'media', 'alta']);
-const ESTADOS = new Set(['nueva', 'en_proceso', 'resuelta']);
+// "no_aplica": para incidencias que no se pueden resolver (ej. ya no aplica
+// por cambios externos, duplicada, fuera de alcance, etc.).
+const ESTADOS = new Set(['nueva', 'en_proceso', 'resuelta', 'no_aplica']);
 
 // GET /api/incidents?escuela=&tipo=&estado=&prioridad=&desde=&hasta=&q=&page=&pageSize=
+// Quien no es administrador solo ve las incidencias que el mismo reporto.
 router.get(
   '/',
   requireAuth,
@@ -19,6 +22,7 @@ router.get(
     const pageSize = Math.min(Math.max(parseInt(String(req.query.pageSize || '25'), 10) || 25, 1), 100);
 
     const where: Prisma.IncidentWhereInput = {
+      ...(req.user!.role !== 'administrador' ? { reportanteUserId: req.user!.id } : {}),
       ...(escuela ? { schoolCode: escuela } : {}),
       ...(tipo ? { incidentTypeId: Number(tipo) } : {}),
       ...(estado ? { estado } : {}),
@@ -60,6 +64,8 @@ router.get(
 );
 
 // GET /api/incidents/:id
+// Quien no es administrador solo puede ver el detalle si la reporto el mismo
+// (404 en vez de 403 para no confirmar que la incidencia existe).
 router.get(
   '/:id',
   requireAuth,
@@ -69,6 +75,10 @@ router.get(
       include: { incidentType: true, school: true, section: true },
     });
     if (!incident) {
+      res.status(404).json({ error: 'No encontrada.' });
+      return;
+    }
+    if (req.user!.role !== 'administrador' && incident.reportanteUserId !== req.user!.id) {
       res.status(404).json({ error: 'No encontrada.' });
       return;
     }
@@ -152,6 +162,8 @@ router.patch(
         return;
       }
       data.estado = estado;
+      // Solo "resuelta" marca resolved_at; "no_aplica" es un cierre distinto
+      // (la incidencia no se resolvio, simplemente ya no aplica).
       data.resolvedAt = estado === 'resuelta' ? new Date() : null;
     }
     if (prioridad !== undefined) {
