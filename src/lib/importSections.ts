@@ -15,9 +15,9 @@ export interface ParsedSection {
 
 export interface ImportSummary {
   escuelas_creadas: number;
-  escuelas_actualizadas: number;
+  escuelas_existentes: number;
   secciones_creadas: number;
-  secciones_actualizadas: number;
+  secciones_existentes: number;
   total_escuelas_en_archivo: number;
   total_secciones_en_archivo: number;
 }
@@ -144,10 +144,13 @@ export function parseSectionsCsv(csvContent: string): {
 }
 
 /**
- * Aplica un import de secciones usando Prisma (upsert por escuela y por
- * seccion). Pensado para archivos incrementales que comparte KIRA
- * periodicamente (no para la carga inicial masiva, ver prisma/seed.ts que
- * usa createMany para eso).
+ * Aplica un import de secciones. SOLO AGREGA: las escuelas/secciones que ya
+ * existen se dejan exactamente como estan (no se actualiza ningun campo) y
+ * solo se cuentan como "existentes"; unicamente lo que todavia no existe se
+ * crea. Esto es a proposito (pedido explicito): un sections.csv nuevo nunca
+ * debe pisar datos ya cargados. Pensado para archivos incrementales que
+ * comparte KIRA periodicamente (no para la carga inicial masiva, ver
+ * prisma/seed.ts que usa createMany para eso).
  */
 export async function applySectionsImport(
   prisma: PrismaClient,
@@ -156,27 +159,29 @@ export async function applySectionsImport(
   const { schools, sections } = parseSectionsCsv(csvContent);
 
   let escuelasCreadas = 0;
-  let escuelasActualizadas = 0;
+  let escuelasExistentes = 0;
   for (const [code, name] of schools.entries()) {
     const existing = await prisma.school.findUnique({ where: { code } });
-    await prisma.school.upsert({
-      where: { code },
-      create: { code, name },
-      update: { name },
-    });
-    if (existing) escuelasActualizadas += 1;
-    else escuelasCreadas += 1;
+    if (existing) {
+      escuelasExistentes += 1;
+      continue;
+    }
+    await prisma.school.create({ data: { code, name } });
+    escuelasCreadas += 1;
   }
 
   let seccionesCreadas = 0;
-  let seccionesActualizadas = 0;
+  let seccionesExistentes = 0;
   for (const s of sections) {
     const existing = await prisma.section.findUnique({
       where: { schoolCode_className: { schoolCode: s.school_code, className: s.class_name } },
     });
-    await prisma.section.upsert({
-      where: { schoolCode_className: { schoolCode: s.school_code, className: s.class_name } },
-      create: {
+    if (existing) {
+      seccionesExistentes += 1;
+      continue;
+    }
+    await prisma.section.create({
+      data: {
         schoolCode: s.school_code,
         className: s.class_name,
         grade: s.grade,
@@ -188,26 +193,15 @@ export async function applySectionsImport(
         classPeriod: s.class_period,
         active: true,
       },
-      update: {
-        grade: s.grade,
-        track: s.track,
-        subtrack: s.subtrack,
-        sectionLetter: s.section_letter,
-        tipoClase: s.tipo_clase,
-        subject: s.subject,
-        classPeriod: s.class_period,
-        active: true,
-      },
     });
-    if (existing) seccionesActualizadas += 1;
-    else seccionesCreadas += 1;
+    seccionesCreadas += 1;
   }
 
   return {
     escuelas_creadas: escuelasCreadas,
-    escuelas_actualizadas: escuelasActualizadas,
+    escuelas_existentes: escuelasExistentes,
     secciones_creadas: seccionesCreadas,
-    secciones_actualizadas: seccionesActualizadas,
+    secciones_existentes: seccionesExistentes,
     total_escuelas_en_archivo: schools.size,
     total_secciones_en_archivo: sections.length,
   };

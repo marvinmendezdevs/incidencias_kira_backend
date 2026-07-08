@@ -6,6 +6,7 @@ import {
   setAuthCookie,
   clearAuthCookie,
   requireAuth,
+  UserNotAuthorizedError,
 } from '../auth';
 import { asyncHandler } from '../lib/asyncHandler';
 
@@ -26,6 +27,10 @@ router.post(
       setAuthCookie(res, token);
       res.json({ user });
     } catch (err) {
+      if (err instanceof UserNotAuthorizedError) {
+        res.status(403).json({ error: err.message });
+        return;
+      }
       // eslint-disable-next-line no-console
       console.error('[auth/google]', (err as Error).message);
       res.status(401).json({ error: 'No se pudo verificar la sesion de Google.' });

@@ -27,20 +27,28 @@ function mapSection(s: Section) {
   };
 }
 
-// GET /api/schools?q=texto
+// GET /api/schools?q=texto&page=1&pageSize=20
 router.get(
   '/schools',
   requireAuth,
   asyncHandler(async (req: Request, res: Response) => {
     const q = String(req.query.q || '').trim();
-    const rows = await prisma.school.findMany({
-      where: q
-        ? { OR: [{ name: { contains: q, mode: 'insensitive' } }, { code: { contains: q, mode: 'insensitive' } }] }
-        : undefined,
-      orderBy: { name: 'asc' },
-      take: q ? 50 : 100,
-    });
-    res.json({ schools: rows.map((s) => ({ code: s.code, name: s.name })) });
+    const page = Math.max(parseInt(String(req.query.page || '1'), 10) || 1, 1);
+    const pageSize = Math.min(Math.max(parseInt(String(req.query.pageSize || '20'), 10) || 20, 1), 100);
+    const where = q
+      ? { OR: [{ name: { contains: q, mode: 'insensitive' as const } }, { code: { contains: q, mode: 'insensitive' as const } }] }
+      : undefined;
+
+    const [total, rows] = await Promise.all([
+      prisma.school.count({ where }),
+      prisma.school.findMany({
+        where,
+        orderBy: { name: 'asc' },
+        skip: (page - 1) * pageSize,
+        take: pageSize,
+      }),
+    ]);
+    res.json({ schools: rows.map((s) => ({ code: s.code, name: s.name })), total, page, pageSize });
   })
 );
 
@@ -97,7 +105,12 @@ router.get(
   })
 );
 
-// GET /api/sections?schoolCode=XXXX&q=texto&grade=&sectionLetter=&classPeriod=&id=
+// GET /api/sections?schoolCode=XXXX&q=texto&grade=&sectionLetter=&classPeriod=&id=&page=&pageSize=
+// page/pageSize son OPCIONALES para no romper a quien ya consume esto sin
+// paginar (ej. buscar por id): si ninguno de los dos viene en el query, se
+// devuelve el shape viejo { sections } (hasta 300). Si viene alguno, se
+// devuelve paginado { sections, total, page, pageSize } (para "Cargar más"
+// en la lista de secciones de una escuela, que puede tener miles de filas).
 router.get(
   '/sections',
   requireAuth,
@@ -110,29 +123,46 @@ router.get(
       return;
     }
 
-    const rows = await prisma.section.findMany({
-      where: {
-        schoolCode,
-        active: true,
-        ...(id ? { id: Number(id) } : {}),
-        ...(grade ? { grade } : {}),
-        ...(sectionLetter ? { sectionLetter } : {}),
-        ...(classPeriod ? { classPeriod } : {}),
-        ...(q
-          ? {
-              OR: [
-                { className: { contains: q, mode: 'insensitive' } },
-                { grade: { contains: q, mode: 'insensitive' } },
-                { subject: { contains: q, mode: 'insensitive' } },
-                { tipoClase: { contains: q, mode: 'insensitive' } },
-              ],
-            }
-          : {}),
-      },
-      orderBy: [{ grade: 'asc' }, { sectionLetter: 'asc' }, { subject: 'asc' }, { tipoClase: 'asc' }],
-      take: 300,
-    });
-    res.json({ sections: rows.map(mapSection) });
+    const paginated = req.query.page !== undefined || req.query.pageSize !== undefined;
+    const page = Math.max(parseInt(String(req.query.page || '1'), 10) || 1, 1);
+    const pageSize = Math.min(Math.max(parseInt(String(req.query.pageSize || '60'), 10) || 60, 1), 300);
+
+    const where = {
+      schoolCode,
+      active: true,
+      ...(id ? { id: Number(id) } : {}),
+      ...(grade ? { grade } : {}),
+      ...(sectionLetter ? { sectionLetter } : {}),
+      ...(classPeriod ? { classPeriod } : {}),
+      ...(q
+        ? {
+            OR: [
+              { className: { contains: q, mode: 'insensitive' as const } },
+              { grade: { contains: q, mode: 'insensitive' as const } },
+              { subject: { contains: q, mode: 'insensitive' as const } },
+              { tipoClase: { contains: q, mode: 'insensitive' as const } },
+            ],
+          }
+        : {}),
+    };
+    const orderBy = [
+      { grade: 'asc' as const },
+      { sectionLetter: 'asc' as const },
+      { subject: 'asc' as const },
+      { tipoClase: 'asc' as const },
+    ];
+
+    if (!paginated) {
+      const rows = await prisma.section.findMany({ where, orderBy, take: 300 });
+      res.json({ sections: rows.map(mapSection) });
+      return;
+    }
+
+    const [total, rows] = await Promise.all([
+      prisma.section.count({ where }),
+      prisma.section.findMany({ where, orderBy, skip: (page - 1) * pageSize, take: pageSize }),
+    ]);
+    res.json({ sections: rows.map(mapSection), total, page, pageSize });
   })
 );
 

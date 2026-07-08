@@ -7,6 +7,7 @@ import authRoutes from './routes/auth';
 import sectionsRoutes from './routes/sections';
 import incidentTypesRoutes from './routes/incidentTypes';
 import incidentsRoutes from './routes/incidents';
+import usersRoutes from './routes/users';
 
 const app = express();
 
@@ -45,6 +46,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api', sectionsRoutes); // /api/schools, /api/sections, /api/admin/sections/import
 app.use('/api/incident-types', incidentTypesRoutes);
 app.use('/api/incidents', incidentsRoutes);
+app.use('/api/admin/users', usersRoutes);
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {

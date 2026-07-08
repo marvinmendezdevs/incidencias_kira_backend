@@ -50,13 +50,30 @@ export async function verifyGoogleIdToken(idToken: string): Promise<GooglePayloa
   };
 }
 
-/** Crea o actualiza el usuario en la base de datos y calcula su rol. */
+/**
+ * Se lanza cuando alguien intenta iniciar sesion con un correo que no esta
+ * registrado (o que un administrador desactivo) en la tabla users. Antes
+ * cualquier cuenta de Google podia entrar y se auto-creaba en la primera
+ * visita; ahora el acceso esta restringido a quienes ya fueron dados de alta
+ * desde el panel de administrador.
+ */
+export class UserNotAuthorizedError extends Error {
+  constructor() {
+    super('Tu correo no esta registrado en la plataforma. Pide a un administrador que te agregue.');
+    this.name = 'UserNotAuthorizedError';
+  }
+}
+
+/** Verifica que el usuario ya exista y este activo, y actualiza sus datos de login. */
 export async function upsertUser({ sub, email, name }: GooglePayload): Promise<AuthUser> {
-  const role: Role = adminEmailSet().has(email) ? 'administrador' : 'reportante';
-  const user = await prisma.user.upsert({
+  const existing = await prisma.user.findUnique({ where: { email } });
+  if (!existing || !existing.activo) {
+    throw new UserNotAuthorizedError();
+  }
+  const role: Role = adminEmailSet().has(email) ? 'administrador' : (existing.role as Role);
+  const user = await prisma.user.update({
     where: { email },
-    create: { googleSub: sub, email, name, role, lastLoginAt: new Date() },
-    update: { googleSub: sub, name, role, lastLoginAt: new Date() },
+    data: { googleSub: sub, name, role, lastLoginAt: new Date() },
   });
   return { id: user.id, email: user.email, name: user.name || user.email, role: user.role as Role };
 }
