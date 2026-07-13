@@ -127,19 +127,31 @@ test('API Incidencias KIRA (con Postgres real efimero)', async (t) => {
     });
 
     let incidentTypeId: number;
-    await t.test('GET /api/incident-types trae los 13 tipos precargados', async () => {
+    await t.test('GET /api/incident-types trae solo los 6 tipos activos por defecto', async () => {
       const res = await request(app).get('/api/incident-types').set('Cookie', adminCookie());
       assert.equal(res.status, 200);
-      assert.equal(res.body.incident_types.length, 13);
+      assert.equal(res.body.incident_types.length, 6);
       incidentTypeId = res.body.incident_types[0].id;
       // Regresion: Prisma devuelve requiereSeccion en camelCase; el API debe
       // traducirlo a requiere_seccion (snake_case) o el filtro de tipos
       // disponibles en el formulario del frontend queda siempre vacio.
-      const conSeccion = res.body.incident_types.find((t: any) => t.nombre === 'Falta docente en la sección');
-      const sinSeccion = res.body.incident_types.find((t: any) => t.nombre === 'Agregar sección nueva');
+      const conSeccion = res.body.incident_types.find((t: any) => t.nombre === 'Eliminar sección');
+      const sinSeccion = res.body.incident_types.find((t: any) => t.nombre === 'Crear sección');
       assert.equal(conSeccion.requiere_seccion, true);
       assert.equal(sinSeccion.requiere_seccion, false);
       assert.equal(conSeccion.requiereSeccion, undefined);
+    });
+
+    await t.test('GET /api/incident-types?includeInactive=1 (admin) trae los 13 tipos totales', async () => {
+      const res = await request(app)
+        .get('/api/incident-types?includeInactive=1')
+        .set('Cookie', adminCookie());
+      assert.equal(res.status, 200);
+      assert.equal(res.body.incident_types.length, 13);
+      const desactivado = res.body.incident_types.find(
+        (t: any) => t.nombre === 'Falta docente en la sección'
+      );
+      assert.equal(desactivado.activo, false);
     });
 
     await t.test('GET /api/schools y /api/sections devuelven la escuela y las clases semilla', async () => {
@@ -228,14 +240,16 @@ test('API Incidencias KIRA (con Postgres real efimero)', async (t) => {
     });
 
     let docenteIncidentId: number;
-    await t.test('POST /api/incidents guarda los datos de contacto del docente', async () => {
-      const docenteType = (await request(app).get('/api/incident-types').set('Cookie', adminCookie())).body
-        .incident_types.find((t: any) => t.nombre === 'Docente con problemas de acceso a la plataforma');
+    await t.test('POST /api/incidents guarda los datos de contacto del docente (aunque el tipo activo ya no sea "de docente")', async () => {
+      // Los 7 tipos de "docentes"/algunos de "estudiantes" fueron desactivados
+      // (ya no se pueden elegir para reportar), pero el backend no filtra los
+      // campos de contacto de docente por tipo: si vienen en el body, se
+      // guardan igual. Usamos un tipo activo cualquiera que requiera seccion.
       const res = await request(app)
         .post('/api/incidents')
         .set('Cookie', adminCookie())
         .send({
-          incident_type_id: docenteType.id,
+          incident_type_id: incidentTypeId,
           school_code: '10001',
           section_id: seedSection.id,
           descripcion: 'El correo registrado esta mal escrito.',
