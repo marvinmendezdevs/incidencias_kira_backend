@@ -24,7 +24,7 @@ export const INCIDENT_TYPES: IncidentTypeSeed[] = [
   { nombre: 'Docente con problemas de acceso a la plataforma', categoria: 'docentes', descripcion: 'El docente no puede ingresar (p. ej. correo mal registrado).', requiereSeccion: true, orden: 80, activo: false },
 
   // Activos.
-  { nombre: 'Agregar lista de estudiantes', categoria: 'estudiantes', descripcion: 'Matricular una lista de 11 o más estudiantes en la sección (menos de 11, lo hace el mismo centro en KIRA).', requiereSeccion: true, orden: 20 },
+  { nombre: 'Agregar lista de estudiantes', categoria: 'estudiantes', descripcion: 'Matricular una lista de 25 o más estudiantes en la sección (menos de 25, lo hace el mismo centro en KIRA).', requiereSeccion: true, orden: 20 },
   { nombre: 'Crear sección', categoria: 'secciones', descripcion: 'Falta crear una sección que aún no existe en KIRA.', requiereSeccion: false, orden: 90 },
   { nombre: 'Eliminar sección', categoria: 'secciones', descripcion: 'Hay que dar de baja una sección existente.', requiereSeccion: true, orden: 100 },
   { nombre: 'Contenido duplicado o no corresponde', categoria: 'contenido', descripcion: 'El contenido de la sección está repetido o no es el correcto.', requiereSeccion: false, orden: 110 },
