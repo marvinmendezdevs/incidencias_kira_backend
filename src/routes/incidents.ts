@@ -11,22 +11,61 @@ const PRIORIDADES = new Set(['baja', 'media', 'alta']);
 // por cambios externos, duplicada, fuera de alcance, etc.).
 const ESTADOS = new Set(['nueva', 'en_proceso', 'resuelta', 'no_aplica']);
 
-// GET /api/incidents?escuela=&tipo=&estado=&prioridad=&desde=&hasta=&q=&page=&pageSize=
+// GET /api/incidents?escuela=&escuelaNombre=&tipo=&estado=&prioridad=&turno=&motivo=&desde=&hasta=&q=&page=&pageSize=
 // Quien no es administrador solo ve las incidencias que el mismo reporto.
 router.get(
   '/',
   requireAuth,
   asyncHandler(async (req: Request, res: Response) => {
-    const { escuela, tipo, estado, prioridad, desde, hasta, q } = req.query as Record<string, string | undefined>;
+    const {
+      escuela,
+      escuelaNombre,
+      tipo,
+      estado,
+      prioridad,
+      turno,
+      motivo,
+      desde,
+      hasta,
+      q,
+    } = req.query as Record<string, string | undefined>;
     const page = Math.max(parseInt(String(req.query.page || '1'), 10) || 1, 1);
     const pageSize = Math.min(Math.max(parseInt(String(req.query.pageSize || '25'), 10) || 25, 1), 100);
 
+    // Búsqueda accent+case insensitive via unaccent (raw SQL → IDs)
+    // Cubre: motivo (descripcion), contenido_detalle, tipo de incidencia,
+    // nombre del reportante y correo del reportante.
+    let searchIds: number[] | null = null;
+    if (q && q.trim()) {
+      const pattern = `%${q.trim()}%`;
+      const rows = await prisma.$queryRaw<{ id: number }[]>`
+        SELECT DISTINCT i.id
+        FROM incidents i
+        JOIN incident_types it ON i.incident_type_id = it.id
+        WHERE
+          unaccent(i.descripcion)                          ILIKE unaccent(${pattern})
+          OR unaccent(COALESCE(i.contenido_detalle, ''))   ILIKE unaccent(${pattern})
+          OR unaccent(it.nombre)                           ILIKE unaccent(${pattern})
+          OR unaccent(COALESCE(i.reportante_nombre, ''))   ILIKE unaccent(${pattern})
+          OR unaccent(COALESCE(i.reportante_email,  ''))   ILIKE unaccent(${pattern})
+      `;
+      searchIds = rows.map((r) => Number(r.id));
+    }
+
     const where: Prisma.IncidentWhereInput = {
+      // Restricción por rol (reportante solo ve las suyas)
       ...(req.user!.role !== 'administrador' ? { reportanteUserId: req.user!.id } : {}),
+      // Filtros de selección
       ...(escuela ? { schoolCode: escuela } : {}),
+      ...(escuelaNombre ? { school: { name: { contains: escuelaNombre, mode: 'insensitive' } } } : {}),
       ...(tipo ? { incidentTypeId: Number(tipo) } : {}),
       ...(estado ? { estado } : {}),
       ...(prioridad ? { prioridad } : {}),
+      // Filtro por turno → aplica sobre la sección relacionada
+      ...(turno ? { section: { classPeriod: { equals: turno, mode: 'insensitive' } } } : {}),
+      // Filtro específico de motivo (descripcion)
+      ...(motivo ? { descripcion: { contains: motivo, mode: 'insensitive' } } : {}),
+      // Rango de fechas
       ...(desde || hasta
         ? {
             createdAt: {
@@ -35,16 +74,8 @@ router.get(
             },
           }
         : {}),
-      ...(q
-        ? {
-            OR: [
-              { descripcion: { contains: q, mode: 'insensitive' } },
-              { docenteNombre: { contains: q, mode: 'insensitive' } },
-              { docenteEmail: { contains: q, mode: 'insensitive' } },
-              { estudiantes: { contains: q, mode: 'insensitive' } },
-            ],
-          }
-        : {}),
+      // IDs resultantes de la búsqueda accent-insensitive
+      ...(searchIds !== null ? { id: { in: searchIds } } : {}),
     };
 
     const [total, rows] = await Promise.all([
