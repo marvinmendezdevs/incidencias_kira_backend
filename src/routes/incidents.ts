@@ -1,11 +1,13 @@
 import { Router, Request, Response } from 'express';
 import { Prisma } from '@prisma/client';
+import * as XLSX from 'xlsx';
 import { prisma } from '../db';
 import { requireAuth, requireAdmin } from '../auth';
 import { asyncHandler } from '../lib/asyncHandler';
 import {
   AiClassifierConfigurationError,
   AiClassifierProviderError,
+  geminiModel,
 } from '../services/ai-incidence-classifier.service';
 import {
   IncidentNotFoundError,
@@ -52,11 +54,15 @@ function filteredNewIncidentsWhere(filters: Record<string, unknown>): Prisma.Inc
   };
 }
 
-function csvCell(value: unknown): string {
-  let content = value == null ? '' : String(value);
-  // Evita que Excel interprete datos escritos por usuarios como formulas.
-  if (/^[=+\-@]/.test(content)) content = `'${content}`;
-  return `"${content.replace(/"/g, '""')}"`;
+function excelCell(value: unknown): unknown {
+  if (typeof value === 'string' && /^[=+\-@]/.test(value)) return `'${value}`;
+  return value ?? '';
+}
+
+function pendingAnalysisWhere(base: Prisma.IncidentWhereInput): Prisma.IncidentWhereInput {
+  return {
+    AND: [base, { OR: [{ aiClassification: null }, { aiClassification: 'REQUIERE_REVISION' }] }],
+  };
 }
 
 // GET /api/incidents?escuela=&escuelaNombre=&tipo=&estado=&prioridad=&turno=&motivo=&desde=&hasta=&q=&page=&pageSize=
@@ -249,31 +255,23 @@ router.post(
     const afterId = Math.max(Number(req.body?.afterId) || 0, 0);
     const batchSize = Math.min(Math.max(Number(req.body?.batchSize) || 10, 1), 20);
     const baseWhere = filteredNewIncidentsWhere(filters);
-    // Reconcilia resultados obtenidos antes de usar el boton masivo.
-    const reconciled = await prisma.incident.updateMany({
-      where: { ...baseWhere, aiClassification: 'NO_APLICA' },
-      data: { estado: 'no_aplica', resolvedAt: null },
-    });
     const candidates = await prisma.incident.findMany({
-      where: { ...baseWhere, aiClassification: null, id: { gt: afterId } },
+      where: { AND: [pendingAnalysisWhere(baseWhere), { id: { gt: afterId } }] },
       select: { id: true },
       orderBy: { id: 'asc' },
       take: batchSize,
     });
 
     const results: Array<{ id: number; classification?: string; error?: string }> = [];
+    let halted = false;
+    let errorReason: string | null = null;
+    let retryAt: string | null = null;
     // Concurrencia baja para respetar mejor los limites del Free Tier.
     for (let index = 0; index < candidates.length; index += 2) {
       const chunk = candidates.slice(index, index + 2);
       const settled = await Promise.allSettled(
         chunk.map(async ({ id }) => {
           const classification = await classifyStoredIncident(id);
-          if (classification.clasificacion === 'NO_APLICA') {
-            await prisma.incident.update({
-              where: { id },
-              data: { estado: 'no_aplica', resolvedAt: null },
-            });
-          }
           return { id, classification: classification.clasificacion };
         })
       );
@@ -283,38 +281,84 @@ router.post(
         else {
           console.error(`[ai-bulk-classifier] incidencia ${id}:`, result.reason);
           results.push({ id, error: 'No se pudo analizar.' });
+          if (!errorReason) {
+            const message = result.reason instanceof Error ? result.reason.message : String(result.reason);
+            if (result.reason instanceof AiClassifierConfigurationError) {
+              errorReason = message;
+            } else if (/429|quota|l[ií]mite|resource_exhausted/i.test(message)) {
+              const retryMatch = message.match(/(?:retry\s*(?:in|delay)[^0-9]*|retryDelay["']?\s*[:=]\s*["']?)(\d+(?:\.\d+)?)\s*s/i);
+              if (retryMatch) {
+                const retrySeconds = Math.max(1, Math.ceil(Number(retryMatch[1])));
+                retryAt = new Date(Date.now() + retrySeconds * 1000).toISOString();
+                errorReason = 'Gemini alcanzó temporalmente el límite de solicitudes.';
+              } else if (/per.?day|requestsperday|tokensperday|daily|quota_exceeded/i.test(message)) {
+                errorReason = 'Gemini agotó la cuota diaria. Revisa el panel de uso para conocer cuándo se restablece.';
+              } else {
+                errorReason = 'Gemini alcanzó el límite de solicitudes y no indicó una hora exacta de reintento.';
+              }
+            } else if (/401|403|api.?key|permission_denied/i.test(message)) {
+              errorReason = 'Gemini rechazó la credencial configurada. Revisa GEMINI_API_KEY.';
+            } else if (/404|not found|modelo/i.test(message)) {
+              errorReason = `El modelo de Gemini configurado no está disponible (${geminiModel()}).`;
+            } else {
+              errorReason = 'Gemini no está respondiendo correctamente. Revisa el registro del backend para ver el detalle.';
+            }
+          }
         }
       });
+      // Si falla todo un grupo, normalmente es un problema general de clave,
+      // modelo o cuota. No repetimos el mismo error para cientos de registros.
+      if (settled.every((result) => result.status === 'rejected')) {
+        halted = true;
+        break;
+      }
     }
 
     const nextAfterId = candidates.at(-1)?.id || afterId;
     const remaining = await prisma.incident.count({
-      where: { ...baseWhere, aiClassification: null, id: { gt: nextAfterId } },
+      where: { AND: [pendingAnalysisWhere(baseWhere), { id: { gt: nextAfterId } }] },
     });
     res.json({
       processed: results.filter((result) => !result.error).length,
       failed: results.filter((result) => result.error).length,
-      markedNoAplica:
-        reconciled.count + results.filter((result) => result.classification === 'NO_APLICA').length,
+      noAplica: results.filter((result) => result.classification === 'NO_APLICA').length,
       nextAfterId,
-      hasMore: remaining > 0,
+      hasMore: !halted && remaining > 0,
+      halted,
+      errorReason,
+      retryAt,
       results,
     });
   })
 );
 
+// GET /api/incidents/analysis-status (admin)
+router.get('/analysis-status', requireAuth, requireAdmin, asyncHandler(async (req: Request, res: Response) => {
+  const where = filteredNewIncidentsWhere(req.query as Record<string, unknown>);
+  const [total, pending] = await Promise.all([
+    prisma.incident.count({ where }),
+    prisma.incident.count({ where: pendingAnalysisWhere(where) }),
+  ]);
+  res.json({ total, analyzed: total - pending, pending, ready: pending === 0 && total > 0 });
+}));
+
 // GET /api/incidents/export-applicable-new (admin)
-// Excel abre CSV UTF-8 directamente. Solo exporta nuevas que la IA marco APLICA.
+// Genera un XLSX real con hojas separadas. No permite exportar resultados parciales.
 router.get(
   '/export-applicable-new',
   requireAuth,
   requireAdmin,
   asyncHandler(async (req: Request, res: Response) => {
+    const where = filteredNewIncidentsWhere(req.query as Record<string, unknown>);
+    const pending = await prisma.incident.count({
+      where: pendingAnalysisWhere(where),
+    });
+    if (pending > 0) {
+      res.status(409).json({ error: `Falta analizar ${pending} incidencia${pending === 1 ? '' : 's'} antes de descargar el Excel.` });
+      return;
+    }
     const rows = await prisma.incident.findMany({
-      where: {
-        ...filteredNewIncidentsWhere(req.query as Record<string, unknown>),
-        aiClassification: 'APLICA',
-      },
+      where: { ...where, aiClassification: { in: ['APLICA', 'NO_APLICA'] } },
       orderBy: { createdAt: 'asc' },
       include: { incidentType: true, aiIncidentType: true, school: true, section: true },
     });
@@ -323,20 +367,27 @@ router.get(
       'Escuela', 'Codigo escuela', 'Grado', 'Seccion', 'Turno', 'Asignatura',
       'Descripcion', 'Detalle', 'Estudiantes', 'Reportante', 'Correo', 'Fecha',
     ];
-    const lines = [header.map(csvCell).join(',')];
-    for (const row of rows) {
-      lines.push([
+    const toValues = (row: (typeof rows)[number]) => [
         row.id, row.incidentType.nombre, row.aiIncidentType?.nombre, row.aiConfidence,
         row.aiReason, row.school.name, row.schoolCode, row.section?.grade,
         row.section?.sectionLetter, row.section?.classPeriod, row.section?.subject,
         row.descripcion, row.contenidoDetalle, row.estudiantes, row.reportanteNombre,
         row.reportanteEmail, row.createdAt.toISOString(),
-      ].map(csvCell).join(','));
-    }
+      ].map(excelCell);
+    const workbook = XLSX.utils.book_new();
+    const addSheet = (name: string, classification: 'APLICA' | 'NO_APLICA') => {
+      const sheet = XLSX.utils.aoa_to_sheet([header, ...rows.filter((row) => row.aiClassification === classification).map(toValues)]);
+      sheet['!autofilter'] = { ref: `A1:Q${Math.max(1, rows.length + 1)}` };
+      sheet['!cols'] = header.map((title) => ({ wch: Math.max(14, title.length + 2) }));
+      XLSX.utils.book_append_sheet(workbook, sheet, name);
+    };
+    addSheet('Aplican', 'APLICA');
+    addSheet('No aplican', 'NO_APLICA');
+    const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
     const date = new Date().toISOString().slice(0, 10);
-    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-    res.setHeader('Content-Disposition', `attachment; filename="incidencias-nuevas-aplican-${date}.csv"`);
-    res.send('\uFEFF' + lines.join('\r\n'));
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="analisis-incidencias-${date}.xlsx"`);
+    res.send(buffer);
   })
 );
 
