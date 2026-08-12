@@ -3,6 +3,16 @@ import { Prisma } from '@prisma/client';
 import { prisma } from '../db';
 import { requireAuth, requireAdmin } from '../auth';
 import { asyncHandler } from '../lib/asyncHandler';
+import {
+  AiClassifierConfigurationError,
+  AiClassifierProviderError,
+} from '../services/ai-incidence-classifier.service';
+import {
+  IncidentNotFoundError,
+  InvalidClassificationReviewError,
+  classifyStoredIncident,
+  reviewAiClassification,
+} from '../services/incidence.service';
 
 const router = Router();
 
@@ -10,6 +20,44 @@ const PRIORIDADES = new Set(['baja', 'media', 'alta']);
 // "no_aplica": para incidencias que no se pueden resolver (ej. ya no aplica
 // por cambios externos, duplicada, fuera de alcance, etc.).
 const ESTADOS = new Set(['nueva', 'en_proceso', 'resuelta', 'no_aplica']);
+
+function filteredNewIncidentsWhere(filters: Record<string, unknown>): Prisma.IncidentWhereInput {
+  const text = (value: unknown) => (typeof value === 'string' ? value.trim() : '');
+  const tipo = Number(filters.tipo);
+  const q = text(filters.q);
+  return {
+    estado: 'nueva',
+    ...(Number.isInteger(tipo) && tipo > 0 ? { incidentTypeId: tipo } : {}),
+    ...(text(filters.prioridad) ? { prioridad: text(filters.prioridad) } : {}),
+    ...(text(filters.escuelaNombre)
+      ? { school: { name: { contains: text(filters.escuelaNombre), mode: 'insensitive' } } }
+      : {}),
+    ...(text(filters.turno)
+      ? { section: { classPeriod: { equals: text(filters.turno), mode: 'insensitive' } } }
+      : {}),
+    ...(text(filters.motivo)
+      ? { descripcion: { contains: text(filters.motivo), mode: 'insensitive' } }
+      : {}),
+    ...(q
+      ? {
+          OR: [
+            { descripcion: { contains: q, mode: 'insensitive' } },
+            { contenidoDetalle: { contains: q, mode: 'insensitive' } },
+            { reportanteNombre: { contains: q, mode: 'insensitive' } },
+            { reportanteEmail: { contains: q, mode: 'insensitive' } },
+            { incidentType: { nombre: { contains: q, mode: 'insensitive' } } },
+          ],
+        }
+      : {}),
+  };
+}
+
+function csvCell(value: unknown): string {
+  let content = value == null ? '' : String(value);
+  // Evita que Excel interprete datos escritos por usuarios como formulas.
+  if (/^[=+\-@]/.test(content)) content = `'${content}`;
+  return `"${content.replace(/"/g, '""')}"`;
+}
 
 // GET /api/incidents?escuela=&escuelaNombre=&tipo=&estado=&prioridad=&turno=&motivo=&desde=&hasta=&q=&page=&pageSize=
 // Quien no es administrador solo ve las incidencias que el mismo reporto.
@@ -85,7 +133,13 @@ router.get(
         orderBy: { createdAt: 'desc' },
         skip: (page - 1) * pageSize,
         take: pageSize,
-        include: { incidentType: true, school: true, section: true },
+        include: {
+          incidentType: true,
+          school: true,
+          section: true,
+          aiIncidentType: true,
+          humanIncidentType: true,
+        },
       }),
     ]);
 
@@ -98,12 +152,18 @@ router.get(
 // Quien no es administrador solo puede ver el detalle si la reporto el mismo
 // (404 en vez de 403 para no confirmar que la incidencia existe).
 router.get(
-  '/:id',
+  '/:id(\\d+)',
   requireAuth,
   asyncHandler(async (req: Request, res: Response) => {
     const incident = await prisma.incident.findUnique({
       where: { id: Number(req.params.id) },
-      include: { incidentType: true, school: true, section: true },
+      include: {
+        incidentType: true,
+        school: true,
+        section: true,
+        aiIncidentType: true,
+        humanIncidentType: true,
+      },
     });
     if (!incident) {
       res.status(404).json({ error: 'No encontrada.' });
@@ -114,6 +174,169 @@ router.get(
       return;
     }
     res.json({ incident: mapIncident(incident) });
+  })
+);
+
+// POST /api/incidents/:id/classify (admin)
+// Genera y guarda una recomendacion. No modifica el tipo elegido ni el estado.
+router.post(
+  '/:id/classify',
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req: Request, res: Response) => {
+    try {
+      const classification = await classifyStoredIncident(Number(req.params.id));
+      res.json({ classification });
+    } catch (error) {
+      if (error instanceof IncidentNotFoundError) {
+        res.status(404).json({ error: error.message });
+        return;
+      }
+      if (error instanceof AiClassifierConfigurationError) {
+        res.status(503).json({ error: error.message });
+        return;
+      }
+      if (error instanceof AiClassifierProviderError) {
+        console.error('[ai-classifier]', error.message);
+        res.status(502).json({ error: 'No fue posible obtener la clasificacion de IA. Intenta nuevamente.' });
+        return;
+      }
+      throw error;
+    }
+  })
+);
+
+// POST /api/incidents/:id/classification-review (admin)
+// Guarda la confirmacion/correccion humana sin alterar la incidencia original.
+router.post(
+  '/:id/classification-review',
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req: Request, res: Response) => {
+    const { clasificacion, tipoIncidenciaId, motivo } = req.body || {};
+    try {
+      await reviewAiClassification({
+        incidentId: Number(req.params.id),
+        reviewerUserId: req.user!.id,
+        clasificacion,
+        tipoIncidenciaId: tipoIncidenciaId == null ? null : Number(tipoIncidenciaId),
+        motivo,
+      });
+      res.json({ ok: true });
+    } catch (error) {
+      if (error instanceof IncidentNotFoundError) {
+        res.status(404).json({ error: error.message });
+        return;
+      }
+      if (error instanceof InvalidClassificationReviewError) {
+        res.status(400).json({ error: error.message });
+        return;
+      }
+      throw error;
+    }
+  })
+);
+
+// POST /api/incidents/bulk-classify-new (admin)
+// Procesa un lote del filtro actual. El frontend repite usando afterId para
+// evitar una unica peticion larga y hacer visible el progreso.
+router.post(
+  '/bulk-classify-new',
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req: Request, res: Response) => {
+    const filters = (req.body?.filters || {}) as Record<string, unknown>;
+    const afterId = Math.max(Number(req.body?.afterId) || 0, 0);
+    const batchSize = Math.min(Math.max(Number(req.body?.batchSize) || 10, 1), 20);
+    const baseWhere = filteredNewIncidentsWhere(filters);
+    // Reconcilia resultados obtenidos antes de usar el boton masivo.
+    const reconciled = await prisma.incident.updateMany({
+      where: { ...baseWhere, aiClassification: 'NO_APLICA' },
+      data: { estado: 'no_aplica', resolvedAt: null },
+    });
+    const candidates = await prisma.incident.findMany({
+      where: { ...baseWhere, aiClassification: null, id: { gt: afterId } },
+      select: { id: true },
+      orderBy: { id: 'asc' },
+      take: batchSize,
+    });
+
+    const results: Array<{ id: number; classification?: string; error?: string }> = [];
+    // Concurrencia baja para respetar mejor los limites del Free Tier.
+    for (let index = 0; index < candidates.length; index += 2) {
+      const chunk = candidates.slice(index, index + 2);
+      const settled = await Promise.allSettled(
+        chunk.map(async ({ id }) => {
+          const classification = await classifyStoredIncident(id);
+          if (classification.clasificacion === 'NO_APLICA') {
+            await prisma.incident.update({
+              where: { id },
+              data: { estado: 'no_aplica', resolvedAt: null },
+            });
+          }
+          return { id, classification: classification.clasificacion };
+        })
+      );
+      settled.forEach((result, offset) => {
+        const id = chunk[offset].id;
+        if (result.status === 'fulfilled') results.push(result.value);
+        else {
+          console.error(`[ai-bulk-classifier] incidencia ${id}:`, result.reason);
+          results.push({ id, error: 'No se pudo analizar.' });
+        }
+      });
+    }
+
+    const nextAfterId = candidates.at(-1)?.id || afterId;
+    const remaining = await prisma.incident.count({
+      where: { ...baseWhere, aiClassification: null, id: { gt: nextAfterId } },
+    });
+    res.json({
+      processed: results.filter((result) => !result.error).length,
+      failed: results.filter((result) => result.error).length,
+      markedNoAplica:
+        reconciled.count + results.filter((result) => result.classification === 'NO_APLICA').length,
+      nextAfterId,
+      hasMore: remaining > 0,
+      results,
+    });
+  })
+);
+
+// GET /api/incidents/export-applicable-new (admin)
+// Excel abre CSV UTF-8 directamente. Solo exporta nuevas que la IA marco APLICA.
+router.get(
+  '/export-applicable-new',
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req: Request, res: Response) => {
+    const rows = await prisma.incident.findMany({
+      where: {
+        ...filteredNewIncidentsWhere(req.query as Record<string, unknown>),
+        aiClassification: 'APLICA',
+      },
+      orderBy: { createdAt: 'asc' },
+      include: { incidentType: true, aiIncidentType: true, school: true, section: true },
+    });
+    const header = [
+      'ID', 'Tipo seleccionado', 'Tipo sugerido IA', 'Confianza IA', 'Motivo IA',
+      'Escuela', 'Codigo escuela', 'Grado', 'Seccion', 'Turno', 'Asignatura',
+      'Descripcion', 'Detalle', 'Estudiantes', 'Reportante', 'Correo', 'Fecha',
+    ];
+    const lines = [header.map(csvCell).join(',')];
+    for (const row of rows) {
+      lines.push([
+        row.id, row.incidentType.nombre, row.aiIncidentType?.nombre, row.aiConfidence,
+        row.aiReason, row.school.name, row.schoolCode, row.section?.grade,
+        row.section?.sectionLetter, row.section?.classPeriod, row.section?.subject,
+        row.descripcion, row.contenidoDetalle, row.estudiantes, row.reportanteNombre,
+        row.reportanteEmail, row.createdAt.toISOString(),
+      ].map(csvCell).join(','));
+    }
+    const date = new Date().toISOString().slice(0, 10);
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="incidencias-nuevas-aplican-${date}.csv"`);
+    res.send('\uFEFF' + lines.join('\r\n'));
   })
 );
 
@@ -249,6 +472,19 @@ function mapIncident(row: any) {
     created_at: row.createdAt,
     updated_at: row.updatedAt,
     resolved_at: row.resolvedAt,
+    ai_classification: row.aiClassification,
+    ai_incident_type_id: row.aiIncidentTypeId,
+    ai_incident_type: row.aiIncidentType?.nombre || null,
+    ai_confidence: row.aiConfidence,
+    ai_reason: row.aiReason,
+    ai_analyzed_at: row.aiAnalyzedAt,
+    ai_model: row.aiModel,
+    ai_reviewed: row.aiReviewed,
+    human_classification: row.humanClassification,
+    human_incident_type_id: row.humanIncidentTypeId,
+    human_incident_type: row.humanIncidentType?.nombre || null,
+    human_reason: row.humanReason,
+    ai_reviewed_at: row.aiReviewedAt,
   };
 }
 

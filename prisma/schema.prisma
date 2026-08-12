@@ -62,39 +62,58 @@ model IncidentType {
   activo          Boolean    @default(true)
   orden           Int        @default(0)
   createdAt       DateTime   @default(now()) @map("created_at")
-  incidents       Incident[]
+  incidents       Incident[] @relation("SelectedIncidentType")
+  aiIncidents     Incident[] @relation("AiIncidentType")
+  humanIncidents  Incident[] @relation("HumanIncidentType")
 
   @@map("incident_types")
 }
 
 model Incident {
-  id               Int          @id @default(autoincrement())
-  incidentTypeId   Int          @map("incident_type_id")
-  incidentType     IncidentType @relation(fields: [incidentTypeId], references: [id])
-  schoolCode       String       @map("school_code")
-  school           School       @relation(fields: [schoolCode], references: [code])
-  sectionId        Int?         @map("section_id")
-  section          Section?     @relation(fields: [sectionId], references: [id])
-  descripcion      String
-  docenteNombre    String?      @map("docente_nombre")
-  docenteEmail     String?      @map("docente_email")
-  docenteTelefono  String?      @map("docente_telefono")
-  docenteDui       String?      @map("docente_dui")
-  estudiantes      String?
-  contenidoDetalle String?      @map("contenido_detalle")
-  prioridad        String       @default("media") // "baja" | "media" | "alta"
-  estado           String       @default("nueva") // "nueva" | "en_proceso" | "resuelta"
-  reportanteUserId Int?         @map("reportante_user_id")
-  reportanteUser   User?        @relation(fields: [reportanteUserId], references: [id])
-  reportanteNombre String?      @map("reportante_nombre")
-  reportanteEmail  String?      @map("reportante_email")
-  createdAt        DateTime     @default(now()) @map("created_at")
-  updatedAt        DateTime     @updatedAt @map("updated_at")
-  resolvedAt       DateTime?    @map("resolved_at")
+  id                  Int           @id @default(autoincrement())
+  incidentTypeId      Int           @map("incident_type_id")
+  incidentType        IncidentType  @relation("SelectedIncidentType", fields: [incidentTypeId], references: [id])
+  schoolCode          String        @map("school_code")
+  school              School        @relation(fields: [schoolCode], references: [code])
+  sectionId           Int?          @map("section_id")
+  section             Section?      @relation(fields: [sectionId], references: [id])
+  descripcion         String
+  docenteNombre       String?       @map("docente_nombre")
+  docenteEmail        String?       @map("docente_email")
+  docenteTelefono     String?       @map("docente_telefono")
+  docenteDui          String?       @map("docente_dui")
+  estudiantes         String?
+  contenidoDetalle    String?       @map("contenido_detalle")
+  prioridad           String        @default("media") // "baja" | "media" | "alta"
+  estado              String        @default("nueva") // "nueva" | "en_proceso" | "resuelta"
+  reportanteUserId    Int?          @map("reportante_user_id")
+  reportanteUser      User?         @relation(fields: [reportanteUserId], references: [id])
+  reportanteNombre    String?       @map("reportante_nombre")
+  reportanteEmail     String?       @map("reportante_email")
+  createdAt           DateTime      @default(now()) @map("created_at")
+  updatedAt           DateTime      @updatedAt @map("updated_at")
+  resolvedAt          DateTime?     @map("resolved_at")
+  aiClassification    String?       @map("ai_classification")
+  aiIncidentTypeId    Int?          @map("ai_incident_type_id")
+  aiIncidentType      IncidentType? @relation("AiIncidentType", fields: [aiIncidentTypeId], references: [id], onDelete: SetNull)
+  aiConfidence        Float?        @map("ai_confidence")
+  aiReason            String?       @map("ai_reason")
+  aiAnalyzedAt        DateTime?     @map("ai_analyzed_at")
+  aiModel             String?       @map("ai_model")
+  aiReviewed          Boolean       @default(false) @map("ai_reviewed")
+  humanClassification String?       @map("human_classification")
+  humanIncidentTypeId Int?          @map("human_incident_type_id")
+  humanIncidentType   IncidentType? @relation("HumanIncidentType", fields: [humanIncidentTypeId], references: [id], onDelete: SetNull)
+  humanReason         String?       @map("human_reason")
+  aiReviewedAt        DateTime?     @map("ai_reviewed_at")
+  aiReviewedByUserId  Int?          @map("ai_reviewed_by_user_id")
 
   @@index([schoolCode])
   @@index([estado])
   @@index([incidentTypeId])
   @@index([createdAt])
+  @@index([aiClassification])
+  @@index([aiIncidentTypeId])
+  @@index([humanIncidentTypeId])
   @@map("incidents")
 }

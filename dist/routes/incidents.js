@@ -1,0 +1,196 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+const express_1 = require("express");
+const db_1 = require("../db");
+const auth_1 = require("../auth");
+const asyncHandler_1 = require("../lib/asyncHandler");
+const router = (0, express_1.Router)();
+const PRIORIDADES = new Set(['baja', 'media', 'alta']);
+// "no_aplica": para incidencias que no se pueden resolver (ej. ya no aplica
+// por cambios externos, duplicada, fuera de alcance, etc.).
+const ESTADOS = new Set(['nueva', 'en_proceso', 'resuelta', 'no_aplica']);
+// GET /api/incidents?escuela=&escuelaNombre=&tipo=&estado=&prioridad=&turno=&motivo=&desde=&hasta=&q=&page=&pageSize=
+// Quien no es administrador solo ve las incidencias que el mismo reporto.
+router.get('/', auth_1.requireAuth, (0, asyncHandler_1.asyncHandler)(async (req, res) => {
+    const { escuela, escuelaNombre, tipo, estado, prioridad, turno, motivo, desde, hasta, q, } = req.query;
+    const page = Math.max(parseInt(String(req.query.page || '1'), 10) || 1, 1);
+    const pageSize = Math.min(Math.max(parseInt(String(req.query.pageSize || '25'), 10) || 25, 1), 100);
+    // Búsqueda accent+case insensitive via unaccent (raw SQL → IDs)
+    // Cubre: motivo (descripcion), contenido_detalle, tipo de incidencia,
+    // nombre del reportante y correo del reportante.
+    let searchIds = null;
+    if (q && q.trim()) {
+        const pattern = `%${q.trim()}%`;
+        const rows = await db_1.prisma.$queryRaw `
+        SELECT DISTINCT i.id
+        FROM incidents i
+        JOIN incident_types it ON i.incident_type_id = it.id
+        WHERE
+          unaccent(i.descripcion)                          ILIKE unaccent(${pattern})
+          OR unaccent(COALESCE(i.contenido_detalle, ''))   ILIKE unaccent(${pattern})
+          OR unaccent(it.nombre)                           ILIKE unaccent(${pattern})
+          OR unaccent(COALESCE(i.reportante_nombre, ''))   ILIKE unaccent(${pattern})
+          OR unaccent(COALESCE(i.reportante_email,  ''))   ILIKE unaccent(${pattern})
+      `;
+        searchIds = rows.map((r) => Number(r.id));
+    }
+    const where = {
+        // Restricción por rol (reportante solo ve las suyas)
+        ...(req.user.role !== 'administrador' ? { reportanteUserId: req.user.id } : {}),
+        // Filtros de selección
+        ...(escuela ? { schoolCode: escuela } : {}),
+        ...(escuelaNombre ? { school: { name: { contains: escuelaNombre, mode: 'insensitive' } } } : {}),
+        ...(tipo ? { incidentTypeId: Number(tipo) } : {}),
+        ...(estado ? { estado } : {}),
+        ...(prioridad ? { prioridad } : {}),
+        // Filtro por turno → aplica sobre la sección relacionada
+        ...(turno ? { section: { classPeriod: { equals: turno, mode: 'insensitive' } } } : {}),
+        // Filtro específico de motivo (descripcion)
+        ...(motivo ? { descripcion: { contains: motivo, mode: 'insensitive' } } : {}),
+        // Rango de fechas
+        ...(desde || hasta
+            ? {
+                createdAt: {
+                    ...(desde ? { gte: new Date(desde) } : {}),
+                    ...(hasta ? { lte: new Date(hasta) } : {}),
+                },
+            }
+            : {}),
+        // IDs resultantes de la búsqueda accent-insensitive
+        ...(searchIds !== null ? { id: { in: searchIds } } : {}),
+    };
+    const [total, rows] = await Promise.all([
+        db_1.prisma.incident.count({ where }),
+        db_1.prisma.incident.findMany({
+            where,
+            orderBy: { createdAt: 'desc' },
+            skip: (page - 1) * pageSize,
+            take: pageSize,
+            include: { incidentType: true, school: true, section: true },
+        }),
+    ]);
+    const incidents = rows.map(mapIncident);
+    res.json({ incidents, total, page, pageSize });
+}));
+// GET /api/incidents/:id
+// Quien no es administrador solo puede ver el detalle si la reporto el mismo
+// (404 en vez de 403 para no confirmar que la incidencia existe).
+router.get('/:id', auth_1.requireAuth, (0, asyncHandler_1.asyncHandler)(async (req, res) => {
+    const incident = await db_1.prisma.incident.findUnique({
+        where: { id: Number(req.params.id) },
+        include: { incidentType: true, school: true, section: true },
+    });
+    if (!incident) {
+        res.status(404).json({ error: 'No encontrada.' });
+        return;
+    }
+    if (req.user.role !== 'administrador' && incident.reportanteUserId !== req.user.id) {
+        res.status(404).json({ error: 'No encontrada.' });
+        return;
+    }
+    res.json({ incident: mapIncident(incident) });
+}));
+// POST /api/incidents
+router.post('/', auth_1.requireAuth, (0, asyncHandler_1.asyncHandler)(async (req, res) => {
+    const { incident_type_id, school_code, section_id, descripcion, docente_nombre, docente_email, docente_telefono, docente_dui, estudiantes, contenido_detalle, prioridad, reportante_nombre, } = req.body || {};
+    if (!incident_type_id || !school_code || !descripcion) {
+        res.status(400).json({ error: 'Faltan campos obligatorios: incident_type_id, school_code, descripcion.' });
+        return;
+    }
+    const tipo = await db_1.prisma.incidentType.findFirst({ where: { id: Number(incident_type_id), activo: true } });
+    if (!tipo) {
+        res.status(400).json({ error: 'Tipo de incidencia invalido o inactivo.' });
+        return;
+    }
+    if (tipo.requiereSeccion && !section_id) {
+        res.status(400).json({ error: 'Este tipo de incidencia requiere seleccionar una seccion.' });
+        return;
+    }
+    const prioridadFinal = PRIORIDADES.has(prioridad) ? prioridad : 'media';
+    const incident = await db_1.prisma.incident.create({
+        data: {
+            incidentTypeId: Number(incident_type_id),
+            schoolCode: school_code,
+            sectionId: section_id ? Number(section_id) : null,
+            descripcion,
+            docenteNombre: docente_nombre || null,
+            docenteEmail: docente_email || null,
+            docenteTelefono: docente_telefono || null,
+            docenteDui: docente_dui || null,
+            estudiantes: estudiantes || null,
+            contenidoDetalle: contenido_detalle || null,
+            prioridad: prioridadFinal,
+            reportanteUserId: req.user.id,
+            reportanteNombre: reportante_nombre || req.user.name,
+            reportanteEmail: req.user.email,
+        },
+    });
+    res.status(201).json({ id: incident.id });
+}));
+// PATCH /api/incidents/:id (admin) { estado, prioridad }
+router.patch('/:id', auth_1.requireAuth, auth_1.requireAdmin, (0, asyncHandler_1.asyncHandler)(async (req, res) => {
+    const { estado, prioridad } = req.body || {};
+    const data = {};
+    if (estado !== undefined) {
+        if (!ESTADOS.has(estado)) {
+            res.status(400).json({ error: 'Estado invalido.' });
+            return;
+        }
+        data.estado = estado;
+        // Solo "resuelta" marca resolved_at; "no_aplica" es un cierre distinto
+        // (la incidencia no se resolvio, simplemente ya no aplica).
+        data.resolvedAt = estado === 'resuelta' ? new Date() : null;
+    }
+    if (prioridad !== undefined) {
+        if (!PRIORIDADES.has(prioridad)) {
+            res.status(400).json({ error: 'Prioridad invalida.' });
+            return;
+        }
+        data.prioridad = prioridad;
+    }
+    if (Object.keys(data).length === 0) {
+        res.status(400).json({ error: 'Nada para actualizar.' });
+        return;
+    }
+    try {
+        const incident = await db_1.prisma.incident.update({ where: { id: Number(req.params.id) }, data });
+        res.json({ incident: { id: incident.id, estado: incident.estado, prioridad: incident.prioridad } });
+    }
+    catch {
+        res.status(404).json({ error: 'No encontrada.' });
+    }
+}));
+// Aplana los datos incluidos (incidentType/school/section) al formato plano
+// que ya consume el frontend (tipo_nombre, school_name, class_name, etc.).
+function mapIncident(row) {
+    return {
+        id: row.id,
+        incident_type_id: row.incidentTypeId,
+        tipo_nombre: row.incidentType?.nombre,
+        categoria: row.incidentType?.categoria,
+        school_code: row.schoolCode,
+        school_name: row.school?.name,
+        section_id: row.sectionId,
+        class_name: row.section?.className,
+        grade: row.section?.grade,
+        section_letter: row.section?.sectionLetter,
+        tipo_clase: row.section?.tipoClase,
+        subject: row.section?.subject,
+        class_period: row.section?.classPeriod,
+        descripcion: row.descripcion,
+        docente_nombre: row.docenteNombre,
+        docente_email: row.docenteEmail,
+        docente_telefono: row.docenteTelefono,
+        docente_dui: row.docenteDui,
+        estudiantes: row.estudiantes,
+        contenido_detalle: row.contenidoDetalle,
+        prioridad: row.prioridad,
+        estado: row.estado,
+        reportante_nombre: row.reportanteNombre,
+        reportante_email: row.reportanteEmail,
+        created_at: row.createdAt,
+        updated_at: row.updatedAt,
+        resolved_at: row.resolvedAt,
+    };
+}
+exports.default = router;
