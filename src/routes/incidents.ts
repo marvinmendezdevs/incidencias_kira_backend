@@ -7,7 +7,8 @@ import { asyncHandler } from '../lib/asyncHandler';
 import {
   AiClassifierConfigurationError,
   AiClassifierProviderError,
-  geminiModel,
+  aiModel,
+  classifyIncidenceWithAi,
 } from '../services/ai-incidence-classifier.service';
 import {
   IncidentNotFoundError,
@@ -22,6 +23,87 @@ const PRIORIDADES = new Set(['baja', 'media', 'alta']);
 // "no_aplica": para incidencias que no se pueden resolver (ej. ya no aplica
 // por cambios externos, duplicada, fuera de alcance, etc.).
 const ESTADOS = new Set(['nueva', 'en_proceso', 'resuelta', 'no_aplica']);
+
+// POST /api/incidents/guidance
+// Orienta al reportante antes de crear una incidencia. No guarda ni modifica datos.
+router.post(
+  '/guidance',
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req: Request, res: Response) => {
+    const { incident_type_id, school_code, section_id, descripcion, contenido_detalle, estudiantes, docente_nombre } =
+      req.body || {};
+    if (!incident_type_id || !school_code || !String(descripcion || contenido_detalle || estudiantes || '').trim()) {
+      res.status(400).json({ error: 'Selecciona un tipo y describe el caso antes de pedir orientación.' });
+      return;
+    }
+
+    const [selectedType, school, section, activeTypes] = await Promise.all([
+      prisma.incidentType.findFirst({ where: { id: Number(incident_type_id), activo: true } }),
+      prisma.school.findUnique({ where: { code: String(school_code) } }),
+      section_id ? prisma.section.findUnique({ where: { id: Number(section_id) } }) : Promise.resolve(null),
+      prisma.incidentType.findMany({ where: { activo: true }, orderBy: [{ orden: 'asc' }, { nombre: 'asc' }] }),
+    ]);
+    if (!selectedType || !school) {
+      res.status(400).json({ error: 'El tipo de incidencia o la escuela no son válidos.' });
+      return;
+    }
+
+    try {
+      const classification = await classifyIncidenceWithAi({
+        description: String(descripcion || '').trim() || String(contenido_detalle || estudiantes || '').trim(),
+        selectedIncidentType: {
+          id: selectedType.id,
+          name: selectedType.nombre,
+          category: selectedType.categoria,
+          description: selectedType.descripcion,
+        },
+        school: school.name,
+        grade: section?.grade || null,
+        section: section?.sectionLetter || null,
+        subject: section?.subject || null,
+        classPeriod: section?.classPeriod || null,
+        additionalDetails: {
+          content: contenido_detalle ? String(contenido_detalle) : null,
+          students: estudiantes ? String(estudiantes) : null,
+          teacherName: docente_nombre ? String(docente_nombre) : null,
+        },
+        availableIncidentTypes: activeTypes.map((type) => ({
+          id: type.id,
+          name: type.nombre,
+          category: type.categoria,
+          description: type.descripcion,
+          requiresSection: type.requiereSeccion,
+        })),
+      });
+      res.json({
+        guidance: {
+          shouldCreate: classification.clasificacion === 'APLICA',
+          decision: classification.clasificacion,
+          suggestedIncidentTypeId: classification.tipoIncidenciaId,
+          suggestedIncidentType: classification.tipoIncidencia,
+          confidence: classification.confianza,
+          message:
+            classification.clasificacion === 'APLICA'
+              ? `Sí conviene crear la incidencia${classification.tipoIncidencia ? ` como "${classification.tipoIncidencia}"` : ''}.`
+              : 'No conviene crear esta incidencia. Intenta resolverla siguiendo la orientación indicada.',
+          reason: classification.motivo,
+        },
+      });
+    } catch (error) {
+      if (error instanceof AiClassifierConfigurationError) {
+        res.status(503).json({ error: error.message });
+        return;
+      }
+      if (error instanceof AiClassifierProviderError) {
+        console.error('[reporter-ai-guidance]', error.message);
+        res.status(502).json({ error: 'No fue posible obtener orientación de IA. Puedes revisar los datos e intentar nuevamente.' });
+        return;
+      }
+      throw error;
+    }
+  })
+);
 
 function filteredNewIncidentsWhere(filters: Record<string, unknown>): Prisma.IncidentWhereInput {
   const text = (value: unknown) => (typeof value === 'string' ? value.trim() : '');
@@ -290,18 +372,22 @@ router.post(
               if (retryMatch) {
                 const retrySeconds = Math.max(1, Math.ceil(Number(retryMatch[1])));
                 retryAt = new Date(Date.now() + retrySeconds * 1000).toISOString();
-                errorReason = 'Gemini alcanzó temporalmente el límite de solicitudes.';
+                errorReason = 'OpenAI alcanzó temporalmente el límite de solicitudes.';
+              } else if (/insufficient_quota|credit_balance_exhausted|no credits remaining/i.test(message)) {
+                errorReason = 'La cuenta de OpenAI no tiene saldo API. Agrega créditos en Billing para continuar.';
               } else if (/per.?day|requestsperday|tokensperday|daily|quota_exceeded/i.test(message)) {
-                errorReason = 'Gemini agotó la cuota diaria. Revisa el panel de uso para conocer cuándo se restablece.';
+                errorReason = 'OpenAI agotó la cuota disponible. Revisa el panel de uso y facturación.';
               } else {
-                errorReason = 'Gemini alcanzó el límite de solicitudes y no indicó una hora exacta de reintento.';
+                errorReason = 'OpenAI alcanzó el límite de solicitudes y no indicó una hora exacta de reintento.';
               }
             } else if (/401|403|api.?key|permission_denied/i.test(message)) {
-              errorReason = 'Gemini rechazó la credencial configurada. Revisa GEMINI_API_KEY.';
+              errorReason = 'OpenAI rechazó la credencial configurada. Revisa OPENAI_API_KEY.';
             } else if (/404|not found|modelo/i.test(message)) {
-              errorReason = `El modelo de Gemini configurado no está disponible (${geminiModel()}).`;
+              errorReason = `El modelo de OpenAI configurado no está disponible (${aiModel()}).`;
+            } else if (/\b5\d\d\b|tiempo maximo|fetch failed|no respondio/i.test(message)) {
+              errorReason = 'OpenAI tuvo una falla temporal incluso después de varios reintentos automáticos.';
             } else {
-              errorReason = 'Gemini no está respondiendo correctamente. Revisa el registro del backend para ver el detalle.';
+              errorReason = `OpenAI no pudo completar el análisis: ${message.slice(0, 240)}`;
             }
           }
         }
@@ -339,29 +425,66 @@ router.get('/analysis-status', requireAuth, requireAdmin, asyncHandler(async (re
     prisma.incident.count({ where }),
     prisma.incident.count({ where: pendingAnalysisWhere(where) }),
   ]);
-  res.json({ total, analyzed: total - pending, pending, ready: pending === 0 && total > 0 });
+  res.json({ total, analyzed: total - pending, pending, ready: total - pending > 0 });
+}));
+
+// POST /api/incidents/by-ids (admin)
+// Busca varias incidencias por sus IDs para resolverlas en bloque.
+router.post('/by-ids', requireAuth, requireAdmin, asyncHandler(async (req: Request, res: Response) => {
+  const submittedIds: unknown[] = Array.isArray(req.body?.ids) ? req.body.ids : [];
+  const ids: number[] = [...new Set(submittedIds
+    .map((id: unknown) => Number(id))
+    .filter((id: number) => Number.isInteger(id) && id > 0))].slice(0, 200);
+  if (ids.length === 0) {
+    res.status(400).json({ error: 'Ingresa al menos un ID válido.' });
+    return;
+  }
+  const rows = await prisma.incident.findMany({
+    where: { id: { in: ids } },
+    include: { incidentType: true, school: true, section: true, aiIncidentType: true, humanIncidentType: true },
+  });
+  const byId = new Map(rows.map((row) => [row.id, row]));
+  res.json({
+    incidents: ids.filter((id) => byId.has(id)).map((id) => mapIncident(byId.get(id))),
+    missingIds: ids.filter((id) => !byId.has(id)),
+  });
+}));
+
+// PATCH /api/incidents/bulk-status (admin)
+router.patch('/bulk-status', requireAuth, requireAdmin, asyncHandler(async (req: Request, res: Response) => {
+  const submittedIds: unknown[] = Array.isArray(req.body?.ids) ? req.body.ids : [];
+  const ids: number[] = [...new Set(submittedIds
+    .map((id: unknown) => Number(id))
+    .filter((id: number) => Number.isInteger(id) && id > 0))].slice(0, 200);
+  const { estado } = req.body || {};
+  if (ids.length === 0 || !['en_proceso', 'resuelta', 'no_aplica'].includes(estado)) {
+    res.status(400).json({ error: 'Selecciona incidencias y un estado válido.' });
+    return;
+  }
+  const result = await prisma.incident.updateMany({
+    where: { id: { in: ids } },
+    data: { estado, resolvedAt: estado === 'resuelta' ? new Date() : null },
+  });
+  res.json({ updated: result.count });
 }));
 
 // GET /api/incidents/export-applicable-new (admin)
-// Genera un XLSX real con hojas separadas. No permite exportar resultados parciales.
+// Genera un XLSX real con las incidencias analizadas, incluso si aún hay pendientes.
 router.get(
   '/export-applicable-new',
   requireAuth,
   requireAdmin,
   asyncHandler(async (req: Request, res: Response) => {
     const where = filteredNewIncidentsWhere(req.query as Record<string, unknown>);
-    const pending = await prisma.incident.count({
-      where: pendingAnalysisWhere(where),
-    });
-    if (pending > 0) {
-      res.status(409).json({ error: `Falta analizar ${pending} incidencia${pending === 1 ? '' : 's'} antes de descargar el Excel.` });
-      return;
-    }
     const rows = await prisma.incident.findMany({
       where: { ...where, aiClassification: { in: ['APLICA', 'NO_APLICA'] } },
       orderBy: { createdAt: 'asc' },
       include: { incidentType: true, aiIncidentType: true, school: true, section: true },
     });
+    if (rows.length === 0) {
+      res.status(409).json({ error: 'Aún no hay incidencias analizadas para descargar.' });
+      return;
+    }
     const header = [
       'ID', 'Tipo seleccionado', 'Tipo sugerido IA', 'Confianza IA', 'Motivo IA',
       'Escuela', 'Codigo escuela', 'Grado', 'Seccion', 'Turno', 'Asignatura',

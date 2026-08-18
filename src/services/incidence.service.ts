@@ -3,7 +3,7 @@ import {
   AiIncidenceClassification,
   IncidenceClassification,
   classifyIncidenceWithAi,
-  geminiModel,
+  aiModel,
 } from './ai-incidence-classifier.service';
 
 const CLASSIFICATIONS = new Set<IncidenceClassification>(['APLICA', 'NO_APLICA', 'REQUIERE_REVISION']);
@@ -59,7 +59,7 @@ export async function classifyStoredIncident(incidentId: number): Promise<AiInci
       aiConfidence: result.confianza,
       aiReason: result.motivo,
       aiAnalyzedAt: new Date(),
-      aiModel: geminiModel(),
+      aiModel: aiModel(),
       aiReviewed: false,
       humanClassification: null,
       humanIncidentTypeId: null,

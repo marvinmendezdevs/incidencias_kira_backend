@@ -13,10 +13,10 @@ exports.INCIDENT_TYPES = [
     { nombre: 'Eliminar docente de una sección', categoria: 'docentes', descripcion: 'Hay que retirar al docente asignado actualmente a la sección.', requiereSeccion: true, orden: 70, activo: false },
     { nombre: 'Docente con problemas de acceso a la plataforma', categoria: 'docentes', descripcion: 'El docente no puede ingresar (p. ej. correo mal registrado).', requiereSeccion: true, orden: 80, activo: false },
     // Activos.
-    { nombre: 'Agregar lista de estudiantes', categoria: 'estudiantes', descripcion: 'Matricular una lista de 25 o más estudiantes en la sección (menos de 25, lo hace el mismo centro en KIRA).', requiereSeccion: true, orden: 20 },
-    { nombre: 'Crear sección', categoria: 'secciones', descripcion: 'Falta crear una sección que aún no existe en KIRA.', requiereSeccion: false, orden: 90 },
-    { nombre: 'Eliminar sección', categoria: 'secciones', descripcion: 'Hay que dar de baja una sección existente.', requiereSeccion: true, orden: 100 },
-    { nombre: 'Contenido duplicado o no corresponde', categoria: 'contenido', descripcion: 'El contenido de la sección está repetido o no es el correcto.', requiereSeccion: false, orden: 110 },
-    { nombre: 'Falta contenido en la sección', categoria: 'contenido', descripcion: 'A la sección le falta contenido asignado.', requiereSeccion: false, orden: 120 },
-    { nombre: 'Contenido con error', categoria: 'contenido', descripcion: 'El contenido tiene errores (ortográficos, técnicos o desactualizados).', requiereSeccion: false, orden: 130 },
+    { nombre: 'Agregar lista de estudiantes', categoria: 'estudiantes', descripcion: 'Agregar alumnos a una clase solo cuando la matrícula sea mayor a 25. Con 25 o menos debe hacerlo el tutor de la escuela.', requiereSeccion: true, orden: 20 },
+    { nombre: 'Crear sección', categoria: 'secciones', descripcion: 'Habilitar y configurar una nueva clase para la asignatura correspondiente.', requiereSeccion: false, orden: 90 },
+    { nombre: 'Eliminar sección', categoria: 'secciones', descripcion: 'Archivar una sección únicamente cuando no cumple con la nomenclatura establecida.', requiereSeccion: true, orden: 100 },
+    { nombre: 'Contenido duplicado o no corresponde', categoria: 'contenido', descripcion: 'Depurar contenido duplicado o que no corresponde a la clase.', requiereSeccion: false, orden: 110 },
+    { nombre: 'Falta contenido en la sección', categoria: 'contenido', descripcion: 'Tipo histórico fuera del alcance operativo actual.', requiereSeccion: false, orden: 120, activo: false },
+    { nombre: 'Contenido con error', categoria: 'contenido', descripcion: 'Rectificar información o contenido erróneo asignado a una clase.', requiereSeccion: false, orden: 130 },
 ];

@@ -1,0 +1,106 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.InvalidClassificationReviewError = exports.IncidentNotFoundError = void 0;
+exports.classifyStoredIncident = classifyStoredIncident;
+exports.reviewAiClassification = reviewAiClassification;
+const db_1 = require("../db");
+const ai_incidence_classifier_service_1 = require("./ai-incidence-classifier.service");
+const CLASSIFICATIONS = new Set(['APLICA', 'NO_APLICA', 'REQUIERE_REVISION']);
+class IncidentNotFoundError extends Error {
+}
+exports.IncidentNotFoundError = IncidentNotFoundError;
+class InvalidClassificationReviewError extends Error {
+}
+exports.InvalidClassificationReviewError = InvalidClassificationReviewError;
+async function classifyStoredIncident(incidentId) {
+    const [incident, activeTypes] = await Promise.all([
+        db_1.prisma.incident.findUnique({
+            where: { id: incidentId },
+            include: { incidentType: true, school: true, section: true },
+        }),
+        db_1.prisma.incidentType.findMany({
+            where: { activo: true },
+            orderBy: [{ orden: 'asc' }, { nombre: 'asc' }],
+        }),
+    ]);
+    if (!incident)
+        throw new IncidentNotFoundError('Incidencia no encontrada.');
+    const result = await (0, ai_incidence_classifier_service_1.classifyIncidenceWithAi)({
+        description: incident.descripcion,
+        selectedIncidentType: {
+            id: incident.incidentType.id,
+            name: incident.incidentType.nombre,
+            category: incident.incidentType.categoria,
+            description: incident.incidentType.descripcion,
+        },
+        school: incident.school.name,
+        grade: incident.section?.grade || null,
+        section: incident.section?.sectionLetter || null,
+        subject: incident.section?.subject || null,
+        classPeriod: incident.section?.classPeriod || null,
+        additionalDetails: {
+            content: incident.contenidoDetalle,
+            students: incident.estudiantes,
+            teacherName: incident.docenteNombre,
+        },
+        availableIncidentTypes: activeTypes.map((type) => ({
+            id: type.id,
+            name: type.nombre,
+            category: type.categoria,
+            description: type.descripcion,
+            requiresSection: type.requiereSeccion,
+        })),
+    });
+    await db_1.prisma.incident.update({
+        where: { id: incidentId },
+        data: {
+            aiClassification: result.clasificacion,
+            aiIncidentTypeId: result.tipoIncidenciaId,
+            aiConfidence: result.confianza,
+            aiReason: result.motivo,
+            aiAnalyzedAt: new Date(),
+            aiModel: (0, ai_incidence_classifier_service_1.aiModel)(),
+            aiReviewed: false,
+            humanClassification: null,
+            humanIncidentTypeId: null,
+            humanReason: null,
+            aiReviewedAt: null,
+            aiReviewedByUserId: null,
+        },
+    });
+    return result;
+}
+async function reviewAiClassification(input) {
+    if (!CLASSIFICATIONS.has(input.clasificacion)) {
+        throw new InvalidClassificationReviewError('Clasificacion humana invalida.');
+    }
+    const incident = await db_1.prisma.incident.findUnique({ where: { id: input.incidentId } });
+    if (!incident)
+        throw new IncidentNotFoundError('Incidencia no encontrada.');
+    if (!incident.aiClassification) {
+        throw new InvalidClassificationReviewError('La incidencia aun no tiene una clasificacion de IA.');
+    }
+    let typeId = null;
+    if (input.clasificacion === 'APLICA') {
+        if (!input.tipoIncidenciaId) {
+            throw new InvalidClassificationReviewError('APLICA requiere indicar el tipo correcto.');
+        }
+        const activeType = await db_1.prisma.incidentType.findFirst({
+            where: { id: input.tipoIncidenciaId, activo: true },
+        });
+        if (!activeType)
+            throw new InvalidClassificationReviewError('El tipo indicado no existe o esta inactivo.');
+        typeId = activeType.id;
+    }
+    return db_1.prisma.incident.update({
+        where: { id: input.incidentId },
+        data: {
+            aiReviewed: true,
+            humanClassification: input.clasificacion,
+            humanIncidentTypeId: typeId,
+            humanReason: input.motivo?.trim().slice(0, 1000) || null,
+            aiReviewedAt: new Date(),
+            aiReviewedByUserId: input.reviewerUserId,
+        },
+    });
+}

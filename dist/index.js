@@ -12,6 +12,7 @@ const sections_1 = __importDefault(require("./routes/sections"));
 const incidentTypes_1 = __importDefault(require("./routes/incidentTypes"));
 const incidents_1 = __importDefault(require("./routes/incidents"));
 const users_1 = __importDefault(require("./routes/users"));
+const daily_ai_analysis_service_1 = require("./services/daily-ai-analysis.service");
 const app = (0, express_1.default)();
 // Red de seguridad a nivel de proceso: si algo (fuera de una ruta de Express
 // envuelta en asyncHandler) rechaza una promesa sin atraparla, Node.js
@@ -54,6 +55,7 @@ if (require.main === module) {
     app.listen(PORT, () => {
         // eslint-disable-next-line no-console
         console.log('Backend Incidencias KIRA escuchando en puerto ' + PORT);
+        (0, daily_ai_analysis_service_1.startDailyAiAnalysisScheduler)();
     });
 }
 exports.default = app;
