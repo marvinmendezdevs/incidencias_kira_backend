@@ -25,7 +25,9 @@ router.post(
       const user = await upsertUser(payload);
       const token = issueToken(user);
       setAuthCookie(res, token);
-      res.json({ user });
+      // Tambien se devuelve el token para que el frontend lo mande en el
+      // header Authorization (ver tokenFromRequest en src/auth.ts).
+      res.json({ user, token });
     } catch (err) {
       if (err instanceof UserNotAuthorizedError) {
         res.status(403).json({ error: err.message });

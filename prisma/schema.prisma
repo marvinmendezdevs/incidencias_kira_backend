@@ -21,6 +21,26 @@ model User {
   @@map("users")
 }
 
+model AiBulkAnalysisUsage {
+  id             Int      @id @default(autoincrement())
+  usageDate      DateTime @unique @db.Date @map("usage_date")
+  executionCount Int      @default(0) @map("execution_count")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  @@map("ai_bulk_analysis_usage")
+}
+
+model AiBulkAnalysisRun {
+  id                String   @id @default(cuid())
+  usageDate         DateTime @db.Date @map("usage_date")
+  initiatedByUserId Int      @map("initiated_by_user_id")
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  @@index([usageDate])
+  @@index([initiatedByUserId])
+  @@map("ai_bulk_analysis_runs")
+}
+
 model School {
   code      String     @id
   name      String

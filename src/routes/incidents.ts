@@ -23,6 +23,17 @@ const PRIORIDADES = new Set(['baja', 'media', 'alta']);
 // "no_aplica": para incidencias que no se pueden resolver (ej. ya no aplica
 // por cambios externos, duplicada, fuera de alcance, etc.).
 const ESTADOS = new Set(['nueva', 'en_proceso', 'resuelta', 'no_aplica']);
+const DAILY_BULK_ANALYSIS_LIMIT = 3;
+const MINIMUM_PENDING_FOR_BULK_ANALYSIS = 50;
+
+function aiUsageDate(): Date {
+  // La fecha del límite sigue el día laboral de El Salvador, no UTC.
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/El_Salvador', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(new Date());
+  const value = (name: Intl.DateTimeFormatPartTypes) => parts.find((part) => part.type === name)?.value;
+  return new Date(`${value('year')}-${value('month')}-${value('day')}T00:00:00.000Z`);
+}
 
 // POST /api/incidents/guidance
 // Orienta al reportante antes de crear una incidencia. No guarda ni modifica datos.
@@ -335,8 +346,48 @@ router.post(
   asyncHandler(async (req: Request, res: Response) => {
     const filters = (req.body?.filters || {}) as Record<string, unknown>;
     const afterId = Math.max(Number(req.body?.afterId) || 0, 0);
+    const runId = typeof req.body?.runId === 'string' ? req.body.runId : '';
     const batchSize = Math.min(Math.max(Number(req.body?.batchSize) || 10, 1), 20);
     const baseWhere = filteredNewIncidentsWhere(filters);
+    const usageDate = aiUsageDate();
+
+    let activeRunId = runId;
+    if (afterId === 0) {
+      const pending = await prisma.incident.count({ where: pendingAnalysisWhere(baseWhere) });
+      if (pending < MINIMUM_PENDING_FOR_BULK_ANALYSIS) {
+        res.status(409).json({
+          error: `Se requieren al menos ${MINIMUM_PENDING_FOR_BULK_ANALYSIS} incidencias nuevas pendientes; actualmente hay ${pending}.`,
+        });
+        return;
+      }
+
+      const run = await prisma.$transaction(async (tx) => {
+        const claimed = await tx.$queryRaw<Array<{ id: number }>>(Prisma.sql`
+          INSERT INTO ai_bulk_analysis_usage (usage_date, execution_count, updated_at)
+          VALUES (${usageDate}, 1, NOW())
+          ON CONFLICT (usage_date) DO UPDATE
+            SET execution_count = ai_bulk_analysis_usage.execution_count + 1, updated_at = NOW()
+            WHERE ai_bulk_analysis_usage.execution_count < ${DAILY_BULK_ANALYSIS_LIMIT}
+          RETURNING id
+        `);
+        if (claimed.length === 0) return null;
+        return tx.aiBulkAnalysisRun.create({ data: { usageDate, initiatedByUserId: req.user!.id } });
+      });
+      if (!run) {
+        res.status(429).json({ error: `Ya se alcanzó el límite de ${DAILY_BULK_ANALYSIS_LIMIT} análisis masivos de IA para hoy.` });
+        return;
+      }
+      activeRunId = run.id;
+    } else {
+      const run = await prisma.aiBulkAnalysisRun.findFirst({
+        where: { id: runId, usageDate, initiatedByUserId: req.user!.id },
+        select: { id: true },
+      });
+      if (!run) {
+        res.status(409).json({ error: 'La sesión de análisis ya no es válida. Inicia el análisis nuevamente.' });
+        return;
+      }
+    }
     const candidates = await prisma.incident.findMany({
       where: { AND: [pendingAnalysisWhere(baseWhere), { id: { gt: afterId } }] },
       select: { id: true },
@@ -413,6 +464,7 @@ router.post(
       halted,
       errorReason,
       retryAt,
+      runId: activeRunId,
       results,
     });
   })
@@ -421,11 +473,22 @@ router.post(
 // GET /api/incidents/analysis-status (admin)
 router.get('/analysis-status', requireAuth, requireAdmin, asyncHandler(async (req: Request, res: Response) => {
   const where = filteredNewIncidentsWhere(req.query as Record<string, unknown>);
-  const [total, pending] = await Promise.all([
+  const [total, pending, usage] = await Promise.all([
     prisma.incident.count({ where }),
     prisma.incident.count({ where: pendingAnalysisWhere(where) }),
+    prisma.aiBulkAnalysisUsage.findUnique({ where: { usageDate: aiUsageDate() }, select: { executionCount: true } }),
   ]);
-  res.json({ total, analyzed: total - pending, pending, ready: total - pending > 0 });
+  const executionsToday = usage?.executionCount || 0;
+  res.json({
+    total,
+    analyzed: total - pending,
+    pending,
+    ready: total - pending > 0,
+    minimumPending: MINIMUM_PENDING_FOR_BULK_ANALYSIS,
+    executionsToday,
+    dailyLimit: DAILY_BULK_ANALYSIS_LIMIT,
+    remainingExecutions: Math.max(DAILY_BULK_ANALYSIS_LIMIT - executionsToday, 0),
+  });
 }));
 
 // POST /api/incidents/by-ids (admin)

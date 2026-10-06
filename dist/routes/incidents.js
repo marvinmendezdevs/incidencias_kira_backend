@@ -34,6 +34,7 @@ var __importStar = (this && this.__importStar) || (function () {
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
 const express_1 = require("express");
+const client_1 = require("@prisma/client");
 const XLSX = __importStar(require("xlsx"));
 const db_1 = require("../db");
 const auth_1 = require("../auth");
@@ -45,9 +46,19 @@ const PRIORIDADES = new Set(['baja', 'media', 'alta']);
 // "no_aplica": para incidencias que no se pueden resolver (ej. ya no aplica
 // por cambios externos, duplicada, fuera de alcance, etc.).
 const ESTADOS = new Set(['nueva', 'en_proceso', 'resuelta', 'no_aplica']);
+const DAILY_BULK_ANALYSIS_LIMIT = 3;
+const MINIMUM_PENDING_FOR_BULK_ANALYSIS = 50;
+function aiUsageDate() {
+    // La fecha del límite sigue el día laboral de El Salvador, no UTC.
+    const parts = new Intl.DateTimeFormat('en-US', {
+        timeZone: 'America/El_Salvador', year: 'numeric', month: '2-digit', day: '2-digit',
+    }).formatToParts(new Date());
+    const value = (name) => parts.find((part) => part.type === name)?.value;
+    return new Date(`${value('year')}-${value('month')}-${value('day')}T00:00:00.000Z`);
+}
 // POST /api/incidents/guidance
 // Orienta al reportante antes de crear una incidencia. No guarda ni modifica datos.
-router.post('/guidance', auth_1.requireAuth, (0, asyncHandler_1.asyncHandler)(async (req, res) => {
+router.post('/guidance', auth_1.requireAuth, auth_1.requireAdmin, (0, asyncHandler_1.asyncHandler)(async (req, res) => {
     const { incident_type_id, school_code, section_id, descripcion, contenido_detalle, estudiantes, docente_nombre } = req.body || {};
     if (!incident_type_id || !school_code || !String(descripcion || contenido_detalle || estudiantes || '').trim()) {
         res.status(400).json({ error: 'Selecciona un tipo y describe el caso antes de pedir orientación.' });
@@ -306,8 +317,48 @@ router.post('/:id/classification-review', auth_1.requireAuth, auth_1.requireAdmi
 router.post('/bulk-classify-new', auth_1.requireAuth, auth_1.requireAdmin, (0, asyncHandler_1.asyncHandler)(async (req, res) => {
     const filters = (req.body?.filters || {});
     const afterId = Math.max(Number(req.body?.afterId) || 0, 0);
+    const runId = typeof req.body?.runId === 'string' ? req.body.runId : '';
     const batchSize = Math.min(Math.max(Number(req.body?.batchSize) || 10, 1), 20);
     const baseWhere = filteredNewIncidentsWhere(filters);
+    const usageDate = aiUsageDate();
+    let activeRunId = runId;
+    if (afterId === 0) {
+        const pending = await db_1.prisma.incident.count({ where: pendingAnalysisWhere(baseWhere) });
+        if (pending < MINIMUM_PENDING_FOR_BULK_ANALYSIS) {
+            res.status(409).json({
+                error: `Se requieren al menos ${MINIMUM_PENDING_FOR_BULK_ANALYSIS} incidencias nuevas pendientes; actualmente hay ${pending}.`,
+            });
+            return;
+        }
+        const run = await db_1.prisma.$transaction(async (tx) => {
+            const claimed = await tx.$queryRaw(client_1.Prisma.sql `
+          INSERT INTO ai_bulk_analysis_usage (usage_date, execution_count, updated_at)
+          VALUES (${usageDate}, 1, NOW())
+          ON CONFLICT (usage_date) DO UPDATE
+            SET execution_count = ai_bulk_analysis_usage.execution_count + 1, updated_at = NOW()
+            WHERE ai_bulk_analysis_usage.execution_count < ${DAILY_BULK_ANALYSIS_LIMIT}
+          RETURNING id
+        `);
+            if (claimed.length === 0)
+                return null;
+            return tx.aiBulkAnalysisRun.create({ data: { usageDate, initiatedByUserId: req.user.id } });
+        });
+        if (!run) {
+            res.status(429).json({ error: `Ya se alcanzó el límite de ${DAILY_BULK_ANALYSIS_LIMIT} análisis masivos de IA para hoy.` });
+            return;
+        }
+        activeRunId = run.id;
+    }
+    else {
+        const run = await db_1.prisma.aiBulkAnalysisRun.findFirst({
+            where: { id: runId, usageDate, initiatedByUserId: req.user.id },
+            select: { id: true },
+        });
+        if (!run) {
+            res.status(409).json({ error: 'La sesión de análisis ya no es válida. Inicia el análisis nuevamente.' });
+            return;
+        }
+    }
     const candidates = await db_1.prisma.incident.findMany({
         where: { AND: [pendingAnalysisWhere(baseWhere), { id: { gt: afterId } }] },
         select: { id: true },
@@ -389,34 +440,81 @@ router.post('/bulk-classify-new', auth_1.requireAuth, auth_1.requireAdmin, (0, a
         halted,
         errorReason,
         retryAt,
+        runId: activeRunId,
         results,
     });
 }));
 // GET /api/incidents/analysis-status (admin)
 router.get('/analysis-status', auth_1.requireAuth, auth_1.requireAdmin, (0, asyncHandler_1.asyncHandler)(async (req, res) => {
     const where = filteredNewIncidentsWhere(req.query);
-    const [total, pending] = await Promise.all([
+    const [total, pending, usage] = await Promise.all([
         db_1.prisma.incident.count({ where }),
         db_1.prisma.incident.count({ where: pendingAnalysisWhere(where) }),
+        db_1.prisma.aiBulkAnalysisUsage.findUnique({ where: { usageDate: aiUsageDate() }, select: { executionCount: true } }),
     ]);
-    res.json({ total, analyzed: total - pending, pending, ready: pending === 0 && total > 0 });
-}));
-// GET /api/incidents/export-applicable-new (admin)
-// Genera un XLSX real con hojas separadas. No permite exportar resultados parciales.
-router.get('/export-applicable-new', auth_1.requireAuth, auth_1.requireAdmin, (0, asyncHandler_1.asyncHandler)(async (req, res) => {
-    const where = filteredNewIncidentsWhere(req.query);
-    const pending = await db_1.prisma.incident.count({
-        where: pendingAnalysisWhere(where),
+    const executionsToday = usage?.executionCount || 0;
+    res.json({
+        total,
+        analyzed: total - pending,
+        pending,
+        ready: total - pending > 0,
+        minimumPending: MINIMUM_PENDING_FOR_BULK_ANALYSIS,
+        executionsToday,
+        dailyLimit: DAILY_BULK_ANALYSIS_LIMIT,
+        remainingExecutions: Math.max(DAILY_BULK_ANALYSIS_LIMIT - executionsToday, 0),
     });
-    if (pending > 0) {
-        res.status(409).json({ error: `Falta analizar ${pending} incidencia${pending === 1 ? '' : 's'} antes de descargar el Excel.` });
+}));
+// POST /api/incidents/by-ids (admin)
+// Busca varias incidencias por sus IDs para resolverlas en bloque.
+router.post('/by-ids', auth_1.requireAuth, auth_1.requireAdmin, (0, asyncHandler_1.asyncHandler)(async (req, res) => {
+    const submittedIds = Array.isArray(req.body?.ids) ? req.body.ids : [];
+    const ids = [...new Set(submittedIds
+            .map((id) => Number(id))
+            .filter((id) => Number.isInteger(id) && id > 0))].slice(0, 200);
+    if (ids.length === 0) {
+        res.status(400).json({ error: 'Ingresa al menos un ID válido.' });
         return;
     }
+    const rows = await db_1.prisma.incident.findMany({
+        where: { id: { in: ids } },
+        include: { incidentType: true, school: true, section: true, aiIncidentType: true, humanIncidentType: true },
+    });
+    const byId = new Map(rows.map((row) => [row.id, row]));
+    res.json({
+        incidents: ids.filter((id) => byId.has(id)).map((id) => mapIncident(byId.get(id))),
+        missingIds: ids.filter((id) => !byId.has(id)),
+    });
+}));
+// PATCH /api/incidents/bulk-status (admin)
+router.patch('/bulk-status', auth_1.requireAuth, auth_1.requireAdmin, (0, asyncHandler_1.asyncHandler)(async (req, res) => {
+    const submittedIds = Array.isArray(req.body?.ids) ? req.body.ids : [];
+    const ids = [...new Set(submittedIds
+            .map((id) => Number(id))
+            .filter((id) => Number.isInteger(id) && id > 0))].slice(0, 200);
+    const { estado } = req.body || {};
+    if (ids.length === 0 || !['en_proceso', 'resuelta', 'no_aplica'].includes(estado)) {
+        res.status(400).json({ error: 'Selecciona incidencias y un estado válido.' });
+        return;
+    }
+    const result = await db_1.prisma.incident.updateMany({
+        where: { id: { in: ids } },
+        data: { estado, resolvedAt: estado === 'resuelta' ? new Date() : null },
+    });
+    res.json({ updated: result.count });
+}));
+// GET /api/incidents/export-applicable-new (admin)
+// Genera un XLSX real con las incidencias analizadas, incluso si aún hay pendientes.
+router.get('/export-applicable-new', auth_1.requireAuth, auth_1.requireAdmin, (0, asyncHandler_1.asyncHandler)(async (req, res) => {
+    const where = filteredNewIncidentsWhere(req.query);
     const rows = await db_1.prisma.incident.findMany({
         where: { ...where, aiClassification: { in: ['APLICA', 'NO_APLICA'] } },
         orderBy: { createdAt: 'asc' },
         include: { incidentType: true, aiIncidentType: true, school: true, section: true },
     });
+    if (rows.length === 0) {
+        res.status(409).json({ error: 'Aún no hay incidencias analizadas para descargar.' });
+        return;
+    }
     const header = [
         'ID', 'Tipo seleccionado', 'Tipo sugerido IA', 'Confianza IA', 'Motivo IA',
         'Escuela', 'Codigo escuela', 'Grado', 'Seccion', 'Turno', 'Asignatura',

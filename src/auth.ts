@@ -127,8 +127,25 @@ declare global {
   }
 }
 
+// El token se acepta por header "Authorization: Bearer <token>" (preferido) o
+// por la cookie de sesion (compatibilidad). Frontend (Netlify) y backend
+// (Render) estan en dominios distintos, asi que la cookie es "de terceros" y
+// algunos navegadores la bloquean (Chrome con cookies de terceros bloqueadas
+// o perfiles administrados, Safari, Brave, incognito). En esos casos el login
+// parecia funcionar pero todas las peticiones siguientes daban 401 y, por
+// ejemplo, la busqueda de centros escolares salia vacia. El header no depende
+// de cookies, asi que funciona en cualquier navegador.
+function tokenFromRequest(req: Request): string | undefined {
+  const header = req.headers.authorization;
+  if (header && header.startsWith('Bearer ')) {
+    const bearer = header.slice('Bearer '.length).trim();
+    if (bearer) return bearer;
+  }
+  return req.cookies ? req.cookies[COOKIE_NAME] : undefined;
+}
+
 export function requireAuth(req: Request, res: Response, next: NextFunction): void {
-  const token = req.cookies && req.cookies[COOKIE_NAME];
+  const token = tokenFromRequest(req);
   if (!token) {
     res.status(401).json({ error: 'No autenticado.' });
     return;
